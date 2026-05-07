@@ -33,6 +33,11 @@ function TalentDiff:ClearComparison()
     self.state.specID = nil
     self.state.diff = nil
     self.state.dirty = true
+    -- Explicit cleanup before the (now no-diff) RefreshOverlays call. ClearAll
+    -- is the one authoritative path that empties the OverlayManager pool, and
+    -- we don't want to depend on RefreshOverlays' button enumeration to reach
+    -- it (talent frame may not be shown right now).
+    if self.OverlayManager then self.OverlayManager:ClearAll() end
     if self.RefreshOverlays then self:RefreshOverlays() end
     if self.UpdateCompareControl then self:UpdateCompareControl() end
 end

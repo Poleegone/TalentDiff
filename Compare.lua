@@ -19,6 +19,17 @@ function TalentDiff:ComputeDiff()
         return nil
     end
 
+    -- Comparing the active saved loadout against itself is structurally a no-op.
+    -- Encode that explicitly so any drift between ReadCurrent and ReadConfig
+    -- (e.g. granted ranks not symmetrically serialised) cannot surface as ghost
+    -- overlays. Diff stays a real object so callers don't have to special-case nil.
+    local activeID = self:GetActiveConfigID()
+    if activeID and state.compareConfigID == activeID then
+        state.diff = { byNode = {}, summary = { added = 0, removed = 0, changed = 0 } }
+        state.dirty = false
+        return state.diff
+    end
+
     local current = self:ReadCurrent()
     local saved = self:ReadConfig(state.compareConfigID)
 

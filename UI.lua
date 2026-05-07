@@ -1,39 +1,13 @@
 local TalentDiff = TalentDiff
 
 local STATUS = TalentDiff.STATUS or {}
+local OverlayManager = TalentDiff.OverlayManager
 
--- Per-status visual descriptors. Indexed by STATUS value (see Compare.lua).
--- RGB chosen for legibility on Blizzard's dark talent-tree backgrounds.
---   color      : edge strip + glow tint
---   glowAlpha  : alpha applied to the circular halo (BACKGROUND, ADD blend)
---   glowPad    : px the halo extends beyond the button rect (outward feel)
---   shadeAlpha : alpha applied to the inward "loss" shade (REMOVED only)
-local STATUS_VISUAL = {
-    [1] = { color = {0.30, 1.00, 0.45, 1.00}, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED
-    [2] = { color = {1.00, 0.18, 0.22, 1.00}, glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.55 }, -- REMOVED
-    [3] = { color = {1.00, 0.78, 0.18, 1.00}, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
-    [4] = { color = {0.50, 0.82, 1.00, 1.00}, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
-}
-
--- Punchier than the prior values so +N / -N reads against icon sheen.
-local DELTA_POS_RGB = {0.30, 1.00, 0.45}
-local DELTA_NEG_RGB = {1.00, 0.30, 0.30}
-
--- Verified-existing retail textures. WHITE8x8 builds the thin per-side outline strips
--- and (tinted black) the inward REMOVED shade; IconBorder-GlowRing is a clean hollow
--- circle for the underlying halo on circular nodes.
-local LINE_TEXTURE  = "Interface\\Buttons\\WHITE8x8"
-local GLOW_TEXTURE  = "Interface\\Buttons\\IconBorder-GlowRing"
-local SHADE_TEXTURE = "Interface\\Buttons\\WHITE8x8"
-
--- Outline geometry. Glow padding is per-status (see STATUS_VISUAL.glowPad).
-local EDGE_THICK   = 2     -- strip thickness in pixels
-local EDGE_INSET   = 2     -- distance outside the button's edge
-
--- Hex helper used by both the dropdown summary and tooltip prefixes so any
--- palette tweak in STATUS_VISUAL propagates to text colors automatically.
+-- Hex helper used by the dropdown summary and tooltip prefixes. Reads from the
+-- OverlayManager's semantic visual table so any palette tweak in one place
+-- propagates to overlays AND text colors automatically.
 local function StatusHex(idx)
-    local v = STATUS_VISUAL[idx]
+    local v = OverlayManager and OverlayManager:GetVisual(idx) or nil
     if not v then return "ffffff" end
     local c = v.color
     return string.format("%02x%02x%02x",
@@ -48,7 +22,6 @@ local diffListToggle            -- "Show Diff" button next to swap
 local diffListPanel             -- floating panel showing per-row diff list
 local AppendTooltipForNode      -- forward declaration; defined in the tooltip-hook section
 local swapInProgress = false    -- true between LoadInProgress and TRAIT_CONFIG_UPDATED/CONFIG_COMMIT_FAILED
-local overlayPool = {}          -- recycle overlay textures keyed by node button
 local hookedTalentFrame = false
 local hookedTooltips = false
 
@@ -89,186 +62,37 @@ local function GetButtonNodeID(button)
     return nil
 end
 
--- True for nodes that visually render as a circle (passives). Choice (Selection) and
--- hero sub-tree picker nodes are wider/asymmetric and should NOT receive the circular halo.
-local function IsCircularNode(button)
-    if not button or not button.GetNodeInfo then return false end
-    local ok, info = pcall(button.GetNodeInfo, button)
-    if not ok or not info or not Enum or not Enum.TraitNodeType then return false end
-    if info.type == Enum.TraitNodeType.Selection then return false end
-    if info.type == Enum.TraitNodeType.SubTreeSelection then return false end
-    return true
-end
-
 -- ---------- Overlay --------------------------------------------------------
-
-local function ReleaseOverlay(button)
-    local ov = overlayPool[button]
-    if ov then ov:Hide() end
-end
-
-local function GetOrCreateOverlay(button)
-    local ov = overlayPool[button]
-    if ov then return ov end
-
-    ov = CreateFrame("Frame", nil, button)
-    ov:EnableMouse(false)  -- never block node interaction
-    ov:SetFrameLevel((button:GetFrameLevel() or 1) + 7)
-    ov:SetAllPoints(button)
-
-    -- Soft circular halo behind the strip outline; only shown for circular (passive) nodes.
-    -- IconBorder-GlowRing is a clean white/grey hollow circle that tints under SetVertexColor.
-    -- Anchored per-apply so we can vary glowPad by status (ADDED gets a wider halo).
-    local glow = ov:CreateTexture(nil, "BACKGROUND", nil, -1)
-    glow:SetTexture(GLOW_TEXTURE)
-    glow:SetBlendMode("ADD")
-    glow:Hide()
-    ov.glow = glow
-
-    -- Inward "loss" shade for REMOVED. ARTWORK sublevel sits above the icon and below
-    -- the OVERLAY edge strips. Mouse passthrough is guaranteed by EnableMouse(false) above.
-    local shade = ov:CreateTexture(nil, "ARTWORK", nil, 2)
-    shade:SetTexture(SHADE_TEXTURE)
-    shade:SetVertexColor(0, 0, 0, 0)   -- alpha set per apply
-    shade:SetAllPoints(ov)             -- exactly the button rect, no bleed
-    shade:Hide()
-    ov.shade = shade
-
-    -- Four thin per-side strips form a shape-agnostic outline that traces whatever rectangular
-    -- bounding box the node uses (square actives, wide choice nodes, sub-tree pickers, …).
-    local function makeEdge()
-        local t = ov:CreateTexture(nil, "OVERLAY", nil, 7)
-        t:SetTexture(LINE_TEXTURE)
-        return t
-    end
-    local top, bottom = makeEdge(), makeEdge()
-    local left, right = makeEdge(), makeEdge()
-
-    -- Top strip: spans full width, sits EDGE_INSET above the button's top.
-    top:SetPoint("BOTTOMLEFT", ov, "TOPLEFT", -EDGE_INSET, EDGE_INSET - EDGE_THICK)
-    top:SetPoint("BOTTOMRIGHT", ov, "TOPRIGHT", EDGE_INSET, EDGE_INSET - EDGE_THICK)
-    top:SetHeight(EDGE_THICK)
-
-    -- Bottom strip: spans full width, sits EDGE_INSET below the button's bottom.
-    bottom:SetPoint("TOPLEFT", ov, "BOTTOMLEFT", -EDGE_INSET, -EDGE_INSET + EDGE_THICK)
-    bottom:SetPoint("TOPRIGHT", ov, "BOTTOMRIGHT", EDGE_INSET, -EDGE_INSET + EDGE_THICK)
-    bottom:SetHeight(EDGE_THICK)
-
-    -- Left strip: spans full height between the top/bottom strips, sits outside the left edge.
-    left:SetPoint("TOPRIGHT", ov, "TOPLEFT", -EDGE_INSET + EDGE_THICK, EDGE_INSET)
-    left:SetPoint("BOTTOMRIGHT", ov, "BOTTOMLEFT", -EDGE_INSET + EDGE_THICK, -EDGE_INSET)
-    left:SetWidth(EDGE_THICK)
-
-    -- Right strip: mirror of left.
-    right:SetPoint("TOPLEFT", ov, "TOPRIGHT", EDGE_INSET - EDGE_THICK, EDGE_INSET)
-    right:SetPoint("BOTTOMLEFT", ov, "BOTTOMRIGHT", EDGE_INSET - EDGE_THICK, -EDGE_INSET)
-    right:SetWidth(EDGE_THICK)
-
-    ov.edges = { top = top, bottom = bottom, left = left, right = right }
-
-    -- Numeric rank-delta label, anchored just outside the top-right corner so descenders
-    -- never clip into the icon and the number sits clear of Blizzard's bottom rank pip.
-    -- Try a punchier outlined template first; CreateFontString errors on unknown names,
-    -- so wrap in pcall and fall back to a guaranteed-present template.
-    local ok, delta = pcall(ov.CreateFontString, ov, nil, "OVERLAY", "NumberFontNormalLargeRightOutline")
-    if not ok or not delta then
-        delta = ov:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
-    end
-    delta:ClearAllPoints()
-    delta:SetPoint("BOTTOMLEFT", ov, "TOPRIGHT", 2, 2)
-    delta:SetJustifyH("RIGHT")
-    delta:Hide()
-    ov.delta = delta
-
-    overlayPool[button] = ov
-    return ov
-end
-
-local function SetEdgesColor(ov, r, g, b, a)
-    for _, e in pairs(ov.edges) do
-        e:SetVertexColor(r, g, b, a or 1)
-    end
-end
-
-local function SetEdgesShown(ov, shown)
-    for _, e in pairs(ov.edges) do
-        if shown then e:Show() else e:Hide() end
-    end
-end
-
-local function ApplyOverlay(button, nodeDiff)
-    if not nodeDiff then
-        ReleaseOverlay(button)
-        return
-    end
-    local visual = STATUS_VISUAL[nodeDiff.status]
-    if not visual then
-        ReleaseOverlay(button)
-        return
-    end
-
-    local ov = GetOrCreateOverlay(button)
-    local r, g, b = visual.color[1], visual.color[2], visual.color[3]
-
-    -- Priority: rank-only differences show the corner delta and nothing else.
-    -- Add/remove/changed show the per-side outline; circular nodes also get a
-    -- halo whose pad/alpha varies by status (ADDED is wider/brighter for
-    -- outward "gain" feel). REMOVED additionally darkens the icon inward for
-    -- "loss" feel.
-    if nodeDiff.status == STATUS.RANK then
-        SetEdgesShown(ov, false)
-        ov.glow:Hide()
-        ov.shade:Hide()
-        local d = (nodeDiff.savedRank or 0) - (nodeDiff.currentRank or 0)
-        local sign = d > 0 and "+" or ""
-        ov.delta:SetText(sign .. tostring(d))
-        local rgb = (d > 0) and DELTA_POS_RGB or DELTA_NEG_RGB
-        ov.delta:SetTextColor(rgb[1], rgb[2], rgb[3], 1)
-        ov.delta:Show()
-    else
-        SetEdgesColor(ov, r, g, b, 1)
-        SetEdgesShown(ov, true)
-
-        if IsCircularNode(button) and visual.glowAlpha > 0 then
-            local pad = visual.glowPad
-            ov.glow:ClearAllPoints()
-            ov.glow:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
-            ov.glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
-            ov.glow:SetVertexColor(r, g, b, visual.glowAlpha)
-            ov.glow:Show()
-        else
-            ov.glow:Hide()
-        end
-
-        if visual.shadeAlpha > 0 then
-            ov.shade:SetVertexColor(0, 0, 0, visual.shadeAlpha)
-            ov.shade:Show()
-        else
-            ov.shade:Hide()
-        end
-
-        ov.delta:Hide()
-    end
-    ov:Show()
-end
+--
+-- All visual painting on talent buttons goes through TalentDiff.OverlayManager
+-- (OverlayManager.lua). UI.lua only owns the Blizzard-frame helpers needed to
+-- enumerate buttons and resolve nodeIDs; the manager handles pool lifecycle,
+-- semantic state application, and stale-overlay reaping.
 
 function TalentDiff:RefreshOverlays()
     local talentFrame = GetTalentFrame()
-    if not talentFrame or not talentFrame:IsShown() then return end
-
-    local diff = self:GetDiff()
-    if not diff then
-        for button in IterTalentButtons(talentFrame) do
-            ReleaseOverlay(button)
-        end
+    if not talentFrame then
+        -- Talent UI hasn't been built yet (first /reload before opening the
+        -- frame). Comparison cleared → drop everything; otherwise wait for the
+        -- frame's OnShow hook to drive the next paint pass.
+        if not self.state.compareConfigID then OverlayManager:ClearAll() end
         return
     end
 
-    for button in IterTalentButtons(talentFrame) do
-        local nodeID = GetButtonNodeID(button)
-        local nd = nodeID and diff.byNode[nodeID] or nil
-        ApplyOverlay(button, nd)
+    local diff = self:GetDiff()
+    if not diff then
+        OverlayManager:ClearAll()
+        return
     end
+
+    -- We always feed the manager iteration callbacks even when the frame is
+    -- hidden — it bumps generation and reaps stale entries that way. Apply()
+    -- still works on hidden buttons; visibility is governed by the parent.
+    OverlayManager:RefreshAll(
+        diff,
+        function() return IterTalentButtons(talentFrame) end,
+        GetButtonNodeID
+    )
 end
 
 -- ---------- Diff-list row data --------------------------------------------
@@ -941,11 +765,11 @@ end
 function AppendTooltipForNode(tooltip, nodeID)
     local nd = TalentDiff:GetNodeDiff(nodeID)
     if not nd then return end
-    local visual = STATUS_VISUAL[nd.status]
+    local visual = OverlayManager and OverlayManager:GetVisual(nd.status) or nil
     if not visual then return end
 
-    -- Prefix hex is sourced from STATUS_VISUAL via StatusHex so palette tweaks
-    -- in one place propagate to both overlays and tooltip text.
+    -- Prefix hex is sourced from the OverlayManager visual table via StatusHex
+    -- so palette tweaks in one place propagate to both overlays and tooltip text.
     tooltip:AddLine(" ")
     if nd.status == STATUS.ADDED then
         tooltip:AddLine("|cff" .. StatusHex(STATUS.ADDED) .. "TalentDiff:|r Will be added by compared loadout"
@@ -1009,9 +833,10 @@ local function HookTalentFrame()
         TalentDiff:RefreshOverlays()
     end)
     talentFrame:HookScript("OnHide", function()
-        for button in IterTalentButtons(talentFrame) do
-            ReleaseOverlay(button)
-        end
+        -- Single authoritative cleanup path: drop every painted overlay so the
+        -- next OnShow paints from a clean state. The active set is the source
+        -- of truth; we don't need to re-iterate buttons here.
+        OverlayManager:ClearAll()
         if diffListPanel then diffListPanel:Hide() end
     end)
 
