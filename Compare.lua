@@ -3,8 +3,8 @@ local TalentDiff = TalentDiff
 -- Diff status constants.
 TalentDiff.STATUS = {
     SAME    = 0,
-    ADDED   = 1, -- selected in current, absent from saved loadout
-    REMOVED = 2, -- selected in saved loadout, absent from current
+    ADDED   = 1, -- present in saved loadout, absent from current (gained on switch)
+    REMOVED = 2, -- present in current, absent from saved loadout (lost on switch)
     CHANGED = 3, -- different entry chosen (choice node)
     RANK    = 4, -- same entry, different rank
 }

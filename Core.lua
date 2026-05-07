@@ -1,8 +1,7 @@
-local addonName, ns = ...
+local addonName = ...
 
 TalentDiff = TalentDiff or {}
 local TalentDiff = TalentDiff
-ns.TalentDiff = TalentDiff
 
 TalentDiff.name = addonName
 TalentDiff.frame = CreateFrame("Frame", "TalentDiffEventFrame")
@@ -10,7 +9,6 @@ TalentDiff.frame = CreateFrame("Frame", "TalentDiffEventFrame")
 -- Comparison state.
 TalentDiff.state = {
     compareConfigID = nil,    -- selected Blizzard loadout configID (nil = none)
-    classID = nil,            -- class of selected loadout
     specID = nil,             -- spec of selected loadout
     diff = nil,               -- cached diff result, see Compare.lua
     dirty = true,             -- needs recompute
@@ -31,7 +29,6 @@ end
 
 function TalentDiff:ClearComparison()
     self.state.compareConfigID = nil
-    self.state.classID = nil
     self.state.specID = nil
     self.state.diff = nil
     self.state.dirty = true
@@ -54,7 +51,6 @@ function TalentDiff:SetComparisonLoadout(configID)
         return
     end
 
-    local _, _, classID = UnitClass("player")
     local specIndex = GetSpecialization and GetSpecialization() or nil
     local currentSpecID = specIndex and select(1, GetSpecializationInfo(specIndex)) or nil
 
@@ -66,7 +62,6 @@ function TalentDiff:SetComparisonLoadout(configID)
     end
 
     self.state.compareConfigID = configID
-    self.state.classID = classID
     self.state.specID = currentSpecID
     self.state.dirty = true
     if self.RefreshOverlays then self:RefreshOverlays() end
@@ -91,7 +86,7 @@ local function OnEvent(self, event, arg1)
         if TalentDiff.NotifyLoadComplete then TalentDiff:NotifyLoadComplete() end
         TalentDiff:MarkDirty()
         if TalentDiff.UpdateCompareControl then TalentDiff:UpdateCompareControl() end
-    elseif event == "PLAYER_SPECIALIZATION_CHANGED" or event == "ACTIVE_PLAYER_SPECIALIZATION_CHANGED" then
+    elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
         -- Spec change may invalidate the chosen comparison loadout.
         if TalentDiff.state.compareConfigID then
             TalentDiff:SetComparisonLoadout(TalentDiff.state.compareConfigID)

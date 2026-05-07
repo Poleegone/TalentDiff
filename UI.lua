@@ -336,6 +336,7 @@ local function EnsureCompareDropdown(talentFrame)
     end)
 
     swapButton:SetScript("OnEnter", function(self)
+        if not GameTooltip then return end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Swap To", 1, 1, 1)
         local sel = TalentDiff.state.compareConfigID
@@ -458,11 +459,11 @@ local function HookTooltips(talentFrame)
     for button in IterTalentButtons(talentFrame) do
         HookButton(button)
     end
+    -- Lazy-hook newly-revealed buttons on each open. The HookTalentFrame OnShow
+    -- below handles refresh/control updates, so this handler is button-hooks only.
     if talentFrame.HookScript then
         talentFrame:HookScript("OnShow", function()
             for button in IterTalentButtons(talentFrame) do HookButton(button) end
-            TalentDiff:RefreshOverlays()
-            TalentDiff:UpdateCompareControl()
         end)
     end
 end
@@ -529,24 +530,17 @@ local function ArmDeferredHook()
 end
 
 function TalentDiff:OnInit()
-    -- Blizzard's PlayerSpellsFrame is in the Blizzard_PlayerSpells addon.
+    -- Blizzard's PlayerSpellsFrame lives in the Blizzard_PlayerSpells addon.
     -- Wait for it to load, then arm the deferred hook on its first OnShow.
-    local function tryArm()
-        if C_AddOns and C_AddOns.IsAddOnLoaded and C_AddOns.IsAddOnLoaded("Blizzard_PlayerSpells") then
-            ArmDeferredHook()
-            return true
-        elseif IsAddOnLoaded and IsAddOnLoaded("Blizzard_PlayerSpells") then
-            ArmDeferredHook()
-            return true
-        end
-        return false
+    if C_AddOns.IsAddOnLoaded("Blizzard_PlayerSpells") then
+        ArmDeferredHook()
+        return
     end
-    if tryArm() then return end
 
     local watcher = CreateFrame("Frame")
     watcher:RegisterEvent("ADDON_LOADED")
     watcher:SetScript("OnEvent", function(frame, _, name)
-        if name == "Blizzard_PlayerSpells" or name == "Blizzard_ClassTalentUI" then
+        if name == "Blizzard_PlayerSpells" then
             frame:UnregisterAllEvents()
             ArmDeferredHook()
         end

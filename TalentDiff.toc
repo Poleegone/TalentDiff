@@ -2,7 +2,7 @@
 ## Title: TalentDiff
 ## Notes: Visual diff layer for Blizzard talent loadouts
 ## Author: Nosebug
-## Version: 1.0.0
+## Version: 1.0.4
 ## X-Curse-Project-ID: 1535944
 
 Core.lua
