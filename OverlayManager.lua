@@ -16,15 +16,18 @@ local TalentDiff = TalentDiff
 -- ---------------------------------------------------------------------------
 
 -- Per-status visual descriptors. Indexed by TalentDiff.STATUS value.
---   color      : edge strip + glow tint
---   glowAlpha  : alpha applied to the circular halo (BACKGROUND, ADD blend)
---   glowPad    : px the halo extends beyond the button rect (outward feel)
---   shadeAlpha : alpha applied to the inward "loss" shade (REMOVED only)
+--   color      : rim tint (also feeds StatusHex / tooltip / panel via GetVisual)
+--   rimAlpha   : alpha applied to the shape-matched rim atlas (primary path)
+--   rimPad     : px the rim extends beyond the button rect (outward feel)
+--   desaturate : whether to dim the underlying icon (REMOVED "loss" feel)
+--   glowAlpha  : LEGACY — alpha for the hollow-circle halo in fallback path
+--   glowPad    : LEGACY — outward pad for the halo in fallback path
+--   shadeAlpha : LEGACY — inward black shade in fallback path
 local STATUS_VISUAL = {
-    [1] = { color = {0.30, 1.00, 0.45, 1.00}, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED
-    [2] = { color = {1.00, 0.18, 0.22, 1.00}, glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.55 }, -- REMOVED
-    [3] = { color = {1.00, 0.78, 0.18, 1.00}, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
-    [4] = { color = {0.50, 0.82, 1.00, 1.00}, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
+    [1] = { color = {0.30, 1.00, 0.45, 1.00}, rimAlpha = 0.85, rimPad = 5, desaturate = false, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED
+    [2] = { color = {1.00, 0.18, 0.22, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = true,  glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.30 }, -- REMOVED
+    [3] = { color = {1.00, 0.78, 0.18, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = false, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
+    [4] = { color = {0.50, 0.82, 1.00, 1.00}, rimAlpha = 0,    rimPad = 0, desaturate = false, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
 }
 
 -- Punchier than the prior values so +N / -N reads against icon sheen.
@@ -61,16 +64,48 @@ end
 
 -- ---------- node-shape classification --------------------------------------
 
--- True for nodes that visually render as a circle (passives). Choice (Selection)
--- and hero sub-tree picker nodes are wider/asymmetric and should NOT receive the
--- circular halo. Defined here because shape only matters for paint.
-local function IsCircularNode(button)
-    if not button or not button.GetNodeInfo then return false end
+-- Classify a button as "circle" (passive talents — circular icons in Blizzard's
+-- talent UI), "choice" (Selection + SubTreeSelection — octagonal in Blizzard's
+-- UI), or nil (unknown / API unavailable). Used to pick a shape-matched rim
+-- atlas; falls back to legacy strip+halo treatment when nil.
+local function GetNodeShape(button)
+    if not button or not button.GetNodeInfo then return nil end
     local ok, info = pcall(button.GetNodeInfo, button)
-    if not ok or not info or not Enum or not Enum.TraitNodeType then return false end
-    if info.type == Enum.TraitNodeType.Selection then return false end
-    if info.type == Enum.TraitNodeType.SubTreeSelection then return false end
-    return true
+    if not ok or not info or not Enum or not Enum.TraitNodeType then return nil end
+    if info.type == Enum.TraitNodeType.Selection then return "choice" end
+    if info.type == Enum.TraitNodeType.SubTreeSelection then return "choice" end
+    return "circle"
+end
+
+-- Resolve a Blizzard atlas name for a given shape, validated once via
+-- C_Texture.GetAtlasInfo so a renamed-or-removed atlas on a future patch
+-- silently falls back to the legacy treatment instead of rendering broken.
+-- Cache stores false for "tried and missing" so we don't poll every paint.
+local RIM_ATLAS_CANDIDATES = {
+    circle = { "talents-node-circle-yellow", "talents-node-pvptalent-yellow" },
+    choice = { "talents-node-choice-yellow", "talents-node-choiceflyout-square-yellow" },
+}
+local rimAtlasCache = {}
+local function ResolveRimAtlas(shape)
+    if not shape then return nil end
+    local cached = rimAtlasCache[shape]
+    if cached ~= nil then
+        return cached or nil
+    end
+    local getInfo = C_Texture and C_Texture.GetAtlasInfo
+    if not getInfo then
+        rimAtlasCache[shape] = false
+        return nil
+    end
+    for _, name in ipairs(RIM_ATLAS_CANDIDATES[shape] or {}) do
+        local ok, info = pcall(getInfo, name)
+        if ok and info then
+            rimAtlasCache[shape] = name
+            return name
+        end
+    end
+    rimAtlasCache[shape] = false
+    return nil
 end
 
 -- ---------- frame creation -------------------------------------------------
@@ -84,9 +119,17 @@ local function GetOrCreate(self, button)
     ov:SetFrameLevel((button:GetFrameLevel() or 1) + 7)
     ov:SetAllPoints(button)
 
-    -- Soft circular halo behind the strip outline; only shown for circular (passive) nodes.
-    -- IconBorder-GlowRing is a clean white/grey hollow circle that tints under SetVertexColor.
-    -- Anchored per-apply so we can vary glowPad by status (ADDED gets a wider halo).
+    -- Primary visual: shape-matched Blizzard rim atlas tinted to status color.
+    -- Lives on BACKGROUND/-2 so it sits behind the icon's own border art but in
+    -- front of the talent tree backdrop — the rim "embraces" the node silhouette
+    -- rather than covering it. SetAtlas is deferred to paint time (the atlas is
+    -- chosen per-button by shape and validated lazily).
+    local rim = ov:CreateTexture(nil, "BACKGROUND", nil, -2)
+    rim:SetBlendMode("ADD")
+    rim:Hide()
+    ov.rim = rim
+
+    -- LEGACY: hollow-circle halo, retained for the missing-atlas fallback.
     local glow = ov:CreateTexture(nil, "BACKGROUND", nil, -1)
     glow:SetTexture(GLOW_TEXTURE)
     glow:SetBlendMode("ADD")
@@ -158,11 +201,40 @@ local function SetEdgesShown(ov, shown)
     end
 end
 
+-- Best-effort icon desaturate for REMOVED. Walks the well-known Blizzard
+-- talent-button portrait field names; if none resolve we no-op (the rim alone
+-- will carry the signal). Tracks whether we touched it so we can restore on
+-- Release / when status flips back.
+local ICON_FIELDS = { "Icon", "icon", "IconTexture", "iconTexture" }
+local function FindIconRegion(button)
+    if not button then return nil end
+    for _, field in ipairs(ICON_FIELDS) do
+        local r = button[field]
+        if r and r.SetDesaturated then return r end
+    end
+    return nil
+end
+
+local function ApplyIconDesaturate(ov, button, on)
+    if on and not ov._iconDesatRegion then
+        local region = FindIconRegion(button)
+        if region then
+            local ok = pcall(region.SetDesaturated, region, true)
+            if ok then ov._iconDesatRegion = region end
+        end
+    elseif not on and ov._iconDesatRegion then
+        pcall(ov._iconDesatRegion.SetDesaturated, ov._iconDesatRegion, false)
+        ov._iconDesatRegion = nil
+    end
+end
+
 -- Rank-only differences show the corner delta and nothing else.
-local function PaintRank(ov, nodeDiff)
+local function PaintRank(ov, button, nodeDiff)
     SetEdgesShown(ov, false)
+    ov.rim:Hide()
     ov.glow:Hide()
     ov.shade:Hide()
+    ApplyIconDesaturate(ov, button, false)
     local d = (nodeDiff.savedRank or 0) - (nodeDiff.currentRank or 0)
     local sign = d > 0 and "+" or ""
     ov.delta:SetText(sign .. tostring(d))
@@ -171,32 +243,56 @@ local function PaintRank(ov, nodeDiff)
     ov.delta:Show()
 end
 
--- Add/remove/changed show the per-side outline; circular nodes also get a halo
--- whose pad/alpha varies by status (ADDED is wider/brighter for outward "gain"
--- feel). REMOVED additionally darkens the icon inward for "loss" feel.
+-- Add/removed/changed: paint a single shape-matched Blizzard rim atlas tinted
+-- to status color. The rim follows the node silhouette so the overlay reads as
+-- "this node is in state X" rather than a colored box on top.
+--
+-- If the atlas can't be resolved (patch drift, unknown node type), fall back to
+-- the legacy strip+halo treatment so the addon never renders blank.
 local function PaintStructural(ov, button, visual)
     local r, g, b = visual.color[1], visual.color[2], visual.color[3]
-    SetEdgesColor(ov, r, g, b, 1)
-    SetEdgesShown(ov, true)
+    local shape = GetNodeShape(button)
+    local atlas = ResolveRimAtlas(shape)
 
-    if IsCircularNode(button) and visual.glowAlpha > 0 then
-        local pad = visual.glowPad
-        ov.glow:ClearAllPoints()
-        ov.glow:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
-        ov.glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
-        ov.glow:SetVertexColor(r, g, b, visual.glowAlpha)
-        ov.glow:Show()
-    else
+    if atlas then
+        local pad = visual.rimPad or 0
+        ov.rim:ClearAllPoints()
+        ov.rim:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
+        ov.rim:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
+        ov.rim:SetAtlas(atlas)
+        ov.rim:SetVertexColor(r, g, b, visual.rimAlpha or 0.8)
+        ov.rim:Show()
+
+        SetEdgesShown(ov, false)
         ov.glow:Hide()
-    end
-
-    if visual.shadeAlpha > 0 then
-        ov.shade:SetVertexColor(0, 0, 0, visual.shadeAlpha)
-        ov.shade:Show()
-    else
         ov.shade:Hide()
+    else
+        -- Legacy fallback path. Preserves the prior visual contract exactly so
+        -- behavior is unchanged on clients where atlases can't resolve.
+        ov.rim:Hide()
+        SetEdgesColor(ov, r, g, b, 1)
+        SetEdgesShown(ov, true)
+
+        if shape == "circle" and (visual.glowAlpha or 0) > 0 then
+            local pad = visual.glowPad
+            ov.glow:ClearAllPoints()
+            ov.glow:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
+            ov.glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
+            ov.glow:SetVertexColor(r, g, b, visual.glowAlpha)
+            ov.glow:Show()
+        else
+            ov.glow:Hide()
+        end
+
+        if (visual.shadeAlpha or 0) > 0 then
+            ov.shade:SetVertexColor(0, 0, 0, visual.shadeAlpha)
+            ov.shade:Show()
+        else
+            ov.shade:Hide()
+        end
     end
 
+    ApplyIconDesaturate(ov, button, visual.desaturate == true)
     ov.delta:Hide()
 end
 
@@ -215,7 +311,7 @@ function OverlayManager:Apply(button, nodeDiff)
 
     local ov = GetOrCreate(self, button)
     if nodeDiff.status == STATUS_RANK then
-        PaintRank(ov, nodeDiff)
+        PaintRank(ov, button, nodeDiff)
     else
         PaintStructural(ov, button, visual)
     end
@@ -230,14 +326,20 @@ end
 function OverlayManager:Release(button)
     if not button then return end
     local ov = self.pool[button]
-    if ov then ov:Hide() end
+    if ov then
+        ApplyIconDesaturate(ov, button, false)
+        ov:Hide()
+    end
     self.activeButtons[button] = nil
 end
 
 function OverlayManager:ClearAll()
     for button in pairs(self.activeButtons) do
         local ov = self.pool[button]
-        if ov then ov:Hide() end
+        if ov then
+            ApplyIconDesaturate(ov, button, false)
+            ov:Hide()
+        end
     end
     self.activeButtons = {}
 end
@@ -281,7 +383,10 @@ function OverlayManager:RefreshAll(diff, iterButtons, getNodeID)
     for button, stamp in pairs(self.activeButtons) do
         if stamp ~= gen then
             local ov = self.pool[button]
-            if ov then ov:Hide() end
+            if ov then
+                ApplyIconDesaturate(ov, button, false)
+                ov:Hide()
+            end
             self.activeButtons[button] = nil
         end
     end
