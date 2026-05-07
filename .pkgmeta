@@ -1,0 +1,8 @@
+package-as: TalentDiff
+
+ignore:
+  - .vscode
+  - .gitignore
+  - .pkgmeta
+  - .guide.md
+  

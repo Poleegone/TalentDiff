@@ -1,0 +1,10 @@
+## Interface: 120005
+## Title: TalentDiff
+## Notes: Visual diff layer for Blizzard talent loadouts
+## Author: Nosebug
+## Version: 1.0.0
+
+Core.lua
+Data.lua
+Compare.lua
+UI.lua
