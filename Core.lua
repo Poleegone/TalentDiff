@@ -22,8 +22,9 @@ end
 
 function TalentDiff:MarkDirty()
     self.state.dirty = true
-    if self.state.compareConfigID and self.RefreshOverlays then
-        self:RefreshOverlays()
+    if self.state.compareConfigID then
+        if self.RefreshOverlays then self:RefreshOverlays() end
+        if self.UpdateDiffPanel then self:UpdateDiffPanel() end
     end
 end
 

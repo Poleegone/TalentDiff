@@ -2,31 +2,63 @@ local TalentDiff = TalentDiff
 
 local STATUS = TalentDiff.STATUS or {}
 
--- Indexed by STATUS value (see Compare.lua).
--- ADDED = green, REMOVED = red, CHANGED = amber, RANK = light blue.
+-- Per-status visual descriptors. Indexed by STATUS value (see Compare.lua).
+-- RGB chosen for legibility on Blizzard's dark talent-tree backgrounds.
+--   color      : edge strip + glow tint
+--   glowAlpha  : alpha applied to the circular halo (BACKGROUND, ADD blend)
+--   glowPad    : px the halo extends beyond the button rect (outward feel)
+--   shadeAlpha : alpha applied to the inward "loss" shade (REMOVED only)
 local STATUS_VISUAL = {
-    [1] = { color = {0.20, 0.95, 0.35, 1.0} }, -- ADDED
-    [2] = { color = {1.00, 0.20, 0.20, 1.0} }, -- REMOVED
-    [3] = { color = {1.00, 0.70, 0.10, 1.0} }, -- CHANGED
-    [4] = { color = {0.40, 0.75, 1.00, 1.0} }, -- RANK
+    [1] = { color = {0.30, 1.00, 0.45, 1.00}, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED
+    [2] = { color = {1.00, 0.18, 0.22, 1.00}, glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.55 }, -- REMOVED
+    [3] = { color = {1.00, 0.78, 0.18, 1.00}, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
+    [4] = { color = {0.50, 0.82, 1.00, 1.00}, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
 }
 
--- Verified-existing retail textures. WHITE8x8 builds the thin per-side outline strips;
--- IconBorder-GlowRing is a clean hollow circle for the underlying halo on circular nodes.
-local LINE_TEXTURE = "Interface\\Buttons\\WHITE8x8"
-local GLOW_TEXTURE = "Interface\\Buttons\\IconBorder-GlowRing"
+-- Punchier than the prior values so +N / -N reads against icon sheen.
+local DELTA_POS_RGB = {0.30, 1.00, 0.45}
+local DELTA_NEG_RGB = {1.00, 0.30, 0.30}
 
--- Outline geometry.
+-- Verified-existing retail textures. WHITE8x8 builds the thin per-side outline strips
+-- and (tinted black) the inward REMOVED shade; IconBorder-GlowRing is a clean hollow
+-- circle for the underlying halo on circular nodes.
+local LINE_TEXTURE  = "Interface\\Buttons\\WHITE8x8"
+local GLOW_TEXTURE  = "Interface\\Buttons\\IconBorder-GlowRing"
+local SHADE_TEXTURE = "Interface\\Buttons\\WHITE8x8"
+
+-- Outline geometry. Glow padding is per-status (see STATUS_VISUAL.glowPad).
 local EDGE_THICK   = 2     -- strip thickness in pixels
 local EDGE_INSET   = 2     -- distance outside the button's edge
-local GLOW_PAD     = 3     -- glow texture extends this many px outside the button
+
+-- Hex helper used by both the dropdown summary and tooltip prefixes so any
+-- palette tweak in STATUS_VISUAL propagates to text colors automatically.
+local function StatusHex(idx)
+    local v = STATUS_VISUAL[idx]
+    if not v then return "ffffff" end
+    local c = v.color
+    return string.format("%02x%02x%02x",
+        math.floor(c[1] * 255 + 0.5),
+        math.floor(c[2] * 255 + 0.5),
+        math.floor(c[3] * 255 + 0.5))
+end
 
 local compareDropdown          -- the "Compare To" dropdown frame
 local swapButton                -- the "Swap To" button next to the dropdown
+local diffListToggle            -- "Show Diff" button next to swap
+local diffListPanel             -- floating panel showing per-row diff list
+local AppendTooltipForNode      -- forward declaration; defined in the tooltip-hook section
 local swapInProgress = false    -- true between LoadInProgress and TRAIT_CONFIG_UPDATED/CONFIG_COMMIT_FAILED
 local overlayPool = {}          -- recycle overlay textures keyed by node button
 local hookedTalentFrame = false
 local hookedTooltips = false
+
+-- Default Blizzard "?" icon used as a final fallback when we can't resolve a real one.
+local FALLBACK_ICON = 134400
+-- Per-row layout constants for the diff list panel.
+local ROW_HEIGHT   = 24
+local ROW_ICON_SZ  = 20
+local ROW_PAD_X    = 6
+local ROW_GAP_Y    = 2
 
 -- ---------- Helpers --------------------------------------------------------
 
@@ -86,13 +118,21 @@ local function GetOrCreateOverlay(button)
 
     -- Soft circular halo behind the strip outline; only shown for circular (passive) nodes.
     -- IconBorder-GlowRing is a clean white/grey hollow circle that tints under SetVertexColor.
+    -- Anchored per-apply so we can vary glowPad by status (ADDED gets a wider halo).
     local glow = ov:CreateTexture(nil, "BACKGROUND", nil, -1)
     glow:SetTexture(GLOW_TEXTURE)
     glow:SetBlendMode("ADD")
-    glow:SetPoint("TOPLEFT", ov, "TOPLEFT", -GLOW_PAD, GLOW_PAD)
-    glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT", GLOW_PAD, -GLOW_PAD)
     glow:Hide()
     ov.glow = glow
+
+    -- Inward "loss" shade for REMOVED. ARTWORK sublevel sits above the icon and below
+    -- the OVERLAY edge strips. Mouse passthrough is guaranteed by EnableMouse(false) above.
+    local shade = ov:CreateTexture(nil, "ARTWORK", nil, 2)
+    shade:SetTexture(SHADE_TEXTURE)
+    shade:SetVertexColor(0, 0, 0, 0)   -- alpha set per apply
+    shade:SetAllPoints(ov)             -- exactly the button rect, no bleed
+    shade:Hide()
+    ov.shade = shade
 
     -- Four thin per-side strips form a shape-agnostic outline that traces whatever rectangular
     -- bounding box the node uses (square actives, wide choice nodes, sub-tree pickers, …).
@@ -126,9 +166,16 @@ local function GetOrCreateOverlay(button)
 
     ov.edges = { top = top, bottom = bottom, left = left, right = right }
 
-    -- Numeric rank-delta label (corner). Outline font removes the need for a separate shadow.
-    local delta = ov:CreateFontString(nil, "OVERLAY", "GameFontNormalOutline")
-    delta:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT", 4, -3)
+    -- Numeric rank-delta label, anchored just outside the top-right corner so descenders
+    -- never clip into the icon and the number sits clear of Blizzard's bottom rank pip.
+    -- Try a punchier outlined template first; CreateFontString errors on unknown names,
+    -- so wrap in pcall and fall back to a guaranteed-present template.
+    local ok, delta = pcall(ov.CreateFontString, ov, nil, "OVERLAY", "NumberFontNormalLargeRightOutline")
+    if not ok or not delta then
+        delta = ov:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+    end
+    delta:ClearAllPoints()
+    delta:SetPoint("BOTTOMLEFT", ov, "TOPRIGHT", 2, 2)
     delta:SetJustifyH("RIGHT")
     delta:Hide()
     ov.delta = delta
@@ -164,28 +211,42 @@ local function ApplyOverlay(button, nodeDiff)
     local r, g, b = visual.color[1], visual.color[2], visual.color[3]
 
     -- Priority: rank-only differences show the corner delta and nothing else.
-    -- Add/remove/changed show the per-side outline (and a circular halo on round nodes).
+    -- Add/remove/changed show the per-side outline; circular nodes also get a
+    -- halo whose pad/alpha varies by status (ADDED is wider/brighter for
+    -- outward "gain" feel). REMOVED additionally darkens the icon inward for
+    -- "loss" feel.
     if nodeDiff.status == STATUS.RANK then
         SetEdgesShown(ov, false)
         ov.glow:Hide()
+        ov.shade:Hide()
         local d = (nodeDiff.savedRank or 0) - (nodeDiff.currentRank or 0)
         local sign = d > 0 and "+" or ""
         ov.delta:SetText(sign .. tostring(d))
-        if d > 0 then
-            ov.delta:SetTextColor(0.20, 0.95, 0.35, 1)
-        else
-            ov.delta:SetTextColor(1.00, 0.25, 0.25, 1)
-        end
+        local rgb = (d > 0) and DELTA_POS_RGB or DELTA_NEG_RGB
+        ov.delta:SetTextColor(rgb[1], rgb[2], rgb[3], 1)
         ov.delta:Show()
     else
         SetEdgesColor(ov, r, g, b, 1)
         SetEdgesShown(ov, true)
-        if IsCircularNode(button) then
-            ov.glow:SetVertexColor(r, g, b, 0.55)
+
+        if IsCircularNode(button) and visual.glowAlpha > 0 then
+            local pad = visual.glowPad
+            ov.glow:ClearAllPoints()
+            ov.glow:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
+            ov.glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
+            ov.glow:SetVertexColor(r, g, b, visual.glowAlpha)
             ov.glow:Show()
         else
             ov.glow:Hide()
         end
+
+        if visual.shadeAlpha > 0 then
+            ov.shade:SetVertexColor(0, 0, 0, visual.shadeAlpha)
+            ov.shade:Show()
+        else
+            ov.shade:Hide()
+        end
+
         ov.delta:Hide()
     end
     ov:Show()
@@ -208,6 +269,149 @@ function TalentDiff:RefreshOverlays()
         local nd = nodeID and diff.byNode[nodeID] or nil
         ApplyOverlay(button, nd)
     end
+end
+
+-- ---------- Diff-list row data --------------------------------------------
+
+-- Resolve {icon, spellID, name} for a given (configID, nodeID) by walking
+-- C_Traits' nodeInfo → activeEntry → definitionInfo chain. spellID drives the
+-- row tooltip; iconID drives the row's icon texture. Falls back gracefully
+-- when any link is missing — rows still render with the diff-supplied name.
+-- Resolve a single entryID into (icon, spellID, name). Tries spell info first
+-- (drives the native talent tooltip on row hover), then falls back to the
+-- definition's overrideIcon / overrideName so passive nodes without a spell
+-- payload still render with the right art.
+local function ResolveEntry(configID, entryID)
+    if not entryID or entryID == 0 then return nil, nil, nil end
+    local entryInfo = C_Traits.GetEntryInfo(configID, entryID)
+    if not entryInfo or not entryInfo.definitionID then return nil, nil, nil end
+    local def = C_Traits.GetDefinitionInfo(entryInfo.definitionID)
+    if not def then return nil, nil, nil end
+
+    local spellID = (def.overriddenSpellID and def.overriddenSpellID > 0) and def.overriddenSpellID
+                 or (def.spellID and def.spellID > 0 and def.spellID)
+                 or nil
+    local icon, name
+    if spellID and C_Spell and C_Spell.GetSpellInfo then
+        local si = C_Spell.GetSpellInfo(spellID)
+        if si then icon, name = si.iconID, si.name end
+    end
+    if not icon and spellID and GetSpellTexture then icon = GetSpellTexture(spellID) end
+    if not icon and def.overrideIcon and def.overrideIcon > 0 then icon = def.overrideIcon end
+    if not name then name = def.overrideName end
+    return icon, spellID, name
+end
+
+-- Resolve a SubTreeSelection node (hero-tree picker). Visuals live on the
+-- subTreeInfo, not the entry's definitionInfo — entries here have no spellID
+-- and no overrideIcon, so the regular ResolveEntry path produces "?". The
+-- subTreeID identifies which hero tree is picked (e.g. Elune's Chosen vs
+-- Druid of the Claw); we resolve its name + icon directly.
+local function ResolveSubTreeVisuals(configID, nodeInfo)
+    if not nodeInfo or not C_Traits or not C_Traits.GetSubTreeInfo then return nil, nil, nil end
+    local subTreeID = nodeInfo.activeEntry and nodeInfo.activeEntry.subTreeID or nil
+    -- Fallback: scan entry list for a subTreeID when activeEntry is missing.
+    if not subTreeID and nodeInfo.entryIDs then
+        for _, eid in ipairs(nodeInfo.entryIDs) do
+            local entryInfo = C_Traits.GetEntryInfo(configID, eid)
+            if entryInfo and entryInfo.subTreeID then
+                subTreeID = entryInfo.subTreeID
+                break
+            end
+        end
+    end
+    if not subTreeID then return nil, nil, nil end
+
+    local sub = C_Traits.GetSubTreeInfo(configID, subTreeID)
+    if not sub then return nil, nil, nil end
+    return sub.iconElementID, nil, sub.name  -- no spellID; row tooltip uses text header
+end
+
+-- Resolve {icon, spellID, name} for the entry the given config has selected at
+-- nodeID. Walks nodeInfo's activeEntry first, with fallbacks for cases where
+-- the engine doesn't fill it in:
+--   * SubTreeSelection nodes (hero-tree pickers) need GetSubTreeInfo lookup.
+--   * Choice nodes where the queried config doesn't have the node picked
+--     (live=nothing or saved=nothing) leave activeEntry nil. We fall back to
+--     the first entryID under nodeInfo.entryIDs so the row at least renders
+--     SOME representative icon for the choice slot — better than "?".
+local function ResolveEntryVisuals(configID, nodeID)
+    if not configID or not nodeID or not C_Traits then return nil, nil, nil end
+    local nodeInfo = C_Traits.GetNodeInfo(configID, nodeID)
+    if not nodeInfo then return nil, nil, nil end
+
+    if Enum and Enum.TraitNodeType and nodeInfo.type == Enum.TraitNodeType.SubTreeSelection then
+        return ResolveSubTreeVisuals(configID, nodeInfo)
+    end
+
+    local entryID = nodeInfo.activeEntry and nodeInfo.activeEntry.entryID or nil
+    local icon, spellID, name = ResolveEntry(configID, entryID)
+    if icon or name then return icon, spellID, name end
+
+    -- Fallback: scan the node's available entries and take the first that
+    -- resolves to something visible. Handles passives whose activeEntry is
+    -- present but the entryID resolves to a definition with no spellID, and
+    -- choice nodes where the queried config doesn't have a pick committed.
+    if nodeInfo.entryIDs then
+        for _, eid in ipairs(nodeInfo.entryIDs) do
+            local i2, s2, n2 = ResolveEntry(configID, eid)
+            if i2 or n2 then return i2, s2, n2 end
+        end
+    end
+    return nil, nil, nil
+end
+
+-- Build an ordered list of row descriptors from the cached diff. Order:
+-- ADDED first (gain), then REMOVED (loss), then CHANGED (swap), then RANK
+-- (rank delta). Within each group, alphabetical by display name.
+local function BuildDiffRowList()
+    local diff = TalentDiff:GetDiff()
+    if not diff or not diff.byNode then return {} end
+    local activeID = TalentDiff:GetActiveConfigID()
+    local savedID = TalentDiff.state.compareConfigID
+    -- ReadCurrent uses C_ClassTalents.GetActiveConfigID (the *base spec config*),
+    -- NOT the saved-loadout activeID. The visual resolver walks the same path.
+    local liveID = C_ClassTalents and C_ClassTalents.GetActiveConfigID and C_ClassTalents.GetActiveConfigID() or activeID
+
+    local groups = { [STATUS.ADDED] = {}, [STATUS.REMOVED] = {}, [STATUS.CHANGED] = {}, [STATUS.RANK] = {} }
+
+    for nodeID, nd in pairs(diff.byNode) do
+        local row = { nodeID = nodeID, status = nd.status }
+        if nd.status == STATUS.ADDED then
+            local icon, spellID, name = ResolveEntryVisuals(savedID, nodeID)
+            row.icon, row.spellID = icon, spellID
+            row.name = name or nd.savedName or "?"
+        elseif nd.status == STATUS.REMOVED then
+            local icon, spellID, name = ResolveEntryVisuals(liveID, nodeID)
+            row.icon, row.spellID = icon, spellID
+            row.name = name or nd.currentName or "?"
+        elseif nd.status == STATUS.CHANGED then
+            local oldIcon, oldSpell, oldName = ResolveEntryVisuals(liveID, nodeID)
+            local newIcon, newSpell, newName = ResolveEntryVisuals(savedID, nodeID)
+            row.icon, row.spellID = newIcon, newSpell
+            row.altIcon, row.altSpellID = oldIcon, oldSpell
+            row.name = (newName or nd.savedName or "?")
+            row.altName = (oldName or nd.currentName or "?")
+        elseif nd.status == STATUS.RANK then
+            local icon, spellID, name = ResolveEntryVisuals(liveID, nodeID)
+            row.icon, row.spellID = icon, spellID
+            row.name = name or nd.currentName or "?"
+            row.currentRank = nd.currentRank or 0
+            row.savedRank = nd.savedRank or 0
+        end
+        if groups[row.status] then
+            table.insert(groups[row.status], row)
+        end
+    end
+
+    local function byName(a, b) return (a.name or "") < (b.name or "") end
+    for _, g in pairs(groups) do table.sort(g, byName) end
+
+    local rows = {}
+    for _, status in ipairs({ STATUS.ADDED, STATUS.REMOVED, STATUS.CHANGED, STATUS.RANK }) do
+        for _, row in ipairs(groups[status] or {}) do rows[#rows + 1] = row end
+    end
+    return rows
 end
 
 -- ---------- Compare-To dropdown --------------------------------------------
@@ -281,6 +485,11 @@ local function EnsureCompareDropdown(talentFrame)
             TalentDiff:Print("Cannot swap loadouts during combat.")
             return
         end
+        -- Immediate UX feedback: dismiss the diff panel as soon as the user
+        -- commits to swapping. The engine-side success path also clears
+        -- comparison via NotifyLoadComplete, but that races on TRAIT_CONFIG_UPDATED
+        -- and shouldn't be the only thing closing the panel.
+        if diffListPanel then diffListPanel:Hide() end
 
         -- Activation pathway, in priority order. Prefer 12.0.5's purpose-built
         -- C_ClassTalents.SwitchTo* engine entry points (which fire the matching
@@ -356,6 +565,25 @@ local function EnsureCompareDropdown(talentFrame)
     end)
     swapButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+    -- "Show Diff" toggle button — opens/closes the floating per-row diff list panel.
+    -- Hidden whenever there is no active comparison (UpdateDiffListToggle handles state).
+    diffListToggle = CreateFrame("Button", "TalentDiffListToggle", talentFrame, "UIPanelButtonTemplate")
+    diffListToggle:SetSize(90, 22)
+    diffListToggle:SetText("Show Diff")
+    diffListToggle:SetPoint("LEFT", swapButton, "RIGHT", 4, 0)
+    diffListToggle:SetScript("OnClick", function()
+        TalentDiff:ToggleDiffPanel()
+    end)
+    diffListToggle:SetScript("OnEnter", function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Show Diff", 1, 1, 1)
+        GameTooltip:AddLine("Open a list of every talent that will be added, removed, swapped, or re-ranked when applying the compared loadout.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    diffListToggle:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    diffListToggle:Hide()
+
     return compareDropdown
 end
 
@@ -371,6 +599,20 @@ function TalentDiff:UpdateCompareControl()
         UIDropDownMenu_SetText(compareDropdown, "Compare to: " .. ((info and info.name) or "?"))
     end
     self:UpdateSwapButton()
+    self:UpdateDiffListToggle()
+    self:UpdateDiffPanel()
+end
+
+-- Show/hide the "Show Diff" toggle based on whether a comparison is active.
+-- The panel itself is hidden separately when comparison clears.
+function TalentDiff:UpdateDiffListToggle()
+    if not diffListToggle then return end
+    if self.state.compareConfigID then
+        diffListToggle:Show()
+    else
+        diffListToggle:Hide()
+        if diffListPanel then diffListPanel:Hide() end
+    end
 end
 
 -- Called from Core.lua on TRAIT_CONFIG_UPDATED / CONFIG_COMMIT_FAILED /
@@ -413,27 +655,310 @@ function TalentDiff:UpdateSwapButton()
     end
 end
 
+-- ---------- Diff list panel -----------------------------------------------
+
+-- Native-feeling backdrop matching Blizzard's BackdropTemplate panels.
+local PANEL_BACKDROP = {
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+}
+
+local function ShowRowTooltip(row)
+    if not GameTooltip then return end
+    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    -- Prefer the spell tooltip for the resolved entry — this matches what the
+    -- native talent button shows. If we couldn't resolve a spellID (rare;
+    -- choice nodes without spell payloads), fall back to a plain text header.
+    local data = row._diffRow
+    if data and data.spellID and GameTooltip.SetSpellByID then
+        GameTooltip:SetSpellByID(data.spellID)
+    else
+        GameTooltip:SetText(data and data.name or "?", 1, 1, 1)
+    end
+    if data and data.nodeID then
+        AppendTooltipForNode(GameTooltip, data.nodeID)
+    end
+    GameTooltip:Show()
+end
+
+-- Row pool keyed per-column so left/right scroll independently.
+local function GetOrCreateColumnRow(column, index)
+    local row = column.rows[index]
+    if row then return row end
+
+    row = CreateFrame("Frame", nil, column.content)
+    row:SetHeight(ROW_HEIGHT)
+
+    local icon = row:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(ROW_ICON_SZ, ROW_ICON_SZ)
+    icon:SetPoint("LEFT", row, "LEFT", ROW_PAD_X, 0)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    row.icon = icon
+
+    local label = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("LEFT",  icon, "RIGHT", 6, 0)
+    label:SetPoint("RIGHT", row,  "RIGHT", -ROW_PAD_X, 0)
+    label:SetJustifyH("LEFT")
+    label:SetWordWrap(false)
+    row.label = label
+
+    row:EnableMouse(true)
+    row:SetScript("OnEnter", function(self) ShowRowTooltip(self) end)
+    row:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+
+    column.rows[index] = row
+    return row
+end
+
+-- Rows in this two-column layout are always single-side:
+--   side = "removed" → red, REMOVED-style (left column)
+--   side = "added"   → green, ADDED-style (right column)
+-- CHANGED splits into two entries (one each side); RANK lands on the side
+-- matching the sign of (savedRank - currentRank).
+local function ApplyColumnRow(row, entry)
+    row._diffRow = entry
+    if entry.icon then row.icon:SetTexture(entry.icon) else row.icon:SetTexture(FALLBACK_ICON) end
+    row.icon:SetDesaturated(entry.side == "removed")
+
+    local hex = (entry.side == "removed") and StatusHex(STATUS.REMOVED) or StatusHex(STATUS.ADDED)
+    local sigil = (entry.side == "removed") and "- " or "+ "
+    local suffix = entry.suffix or ""
+    row.label:SetText(string.format("|cff%s%s%s|r%s", hex, sigil, entry.name or "?", suffix))
+    row:Show()
+end
+
+-- Persist current panel position into SavedVariables so it returns to the
+-- exact spot on /reload. Called from the drag-stop handler.
+local function SavePanelPosition(panel)
+    if not TalentDiffDB then return end
+    local point, _, relativePoint, x, y = panel:GetPoint(1)
+    if not point then return end
+    TalentDiffDB.panel = TalentDiffDB.panel or {}
+    TalentDiffDB.panel.point = point
+    TalentDiffDB.panel.relativePoint = relativePoint
+    TalentDiffDB.panel.x = x
+    TalentDiffDB.panel.y = y
+end
+
+-- Restore saved panel position; if none, anchor to screen center as a sane
+-- first-run default. Anchored to UIParent because the panel is detached.
+local function RestorePanelPosition(panel)
+    panel:ClearAllPoints()
+    local p = TalentDiffDB and TalentDiffDB.panel or nil
+    if p and p.point then
+        panel:SetPoint(p.point, UIParent, p.relativePoint or p.point, p.x or 0, p.y or 0)
+    else
+        panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    end
+end
+
+local function BuildColumn(panel, key, title, anchorOpts)
+    -- One column inside the panel: header + scroll + content. Rows are pooled
+    -- per-column so left and right lists scroll independently.
+    local header = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    header:SetPoint("TOPLEFT",  panel, "TOPLEFT",  anchorOpts.headerLeft,  -50)
+    header:SetPoint("TOPRIGHT", panel, "TOPLEFT",  anchorOpts.headerRight, -50)
+    header:SetJustifyH("LEFT")
+    header:SetText(title)
+
+    local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT",     panel, "TOPLEFT",     anchorOpts.scrollLeft,  -70)
+    scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMLEFT",  anchorOpts.scrollRight,  12)
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetSize(1, 1)
+    scroll:SetScrollChild(content)
+
+    panel[key] = { header = header, scroll = scroll, content = content, rows = {} }
+    return panel[key]
+end
+
+local function EnsureDiffPanel()
+    if diffListPanel then return diffListPanel end
+
+    -- Detached, draggable panel parented to UIParent so it survives the
+    -- talent frame closing and remains positionable anywhere on screen.
+    local panel = CreateFrame("Frame", "TalentDiffListPanel", UIParent, "BackdropTemplate")
+    panel:SetSize(420, 380)
+    panel:SetFrameStrata("HIGH")
+    panel:SetBackdrop(PANEL_BACKDROP)
+    panel:SetBackdropColor(0, 0, 0, 0.88)
+    panel:SetClampedToScreen(true)
+    panel:SetMovable(true)
+    panel:EnableMouse(true)
+    panel:RegisterForDrag("LeftButton")
+    panel:SetScript("OnDragStart", panel.StartMoving)
+    panel:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        SavePanelPosition(self)
+    end)
+    panel:Hide()
+
+    RestorePanelPosition(panel)
+
+    -- Header title.
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", panel, "TOP", 0, -10)
+    title:SetText("Loadout Diff")
+    panel.title = title
+
+    -- Counts line under the header — same at-a-glance summary as before.
+    local counts = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    counts:SetPoint("TOP", title, "BOTTOM", 0, -2)
+    counts:SetJustifyH("CENTER")
+    panel.counts = counts
+
+    -- Close button (top-right).
+    local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", 2, 2)
+    close:SetScript("OnClick", function() panel:Hide() end)
+
+    -- Two columns. Geometry: 420 wide, 12px outer pad, 8px gutter → 196 each.
+    -- Headers + scrolls share the same x-offsets so the visual gutter is clean.
+    BuildColumn(panel, "leftCol", "|cff" .. StatusHex(STATUS.REMOVED) .. "Removed|r",
+        { headerLeft = 16, headerRight = 16 + 196, scrollLeft = 16, scrollRight = 16 + 196 - 18 })
+    BuildColumn(panel, "rightCol", "|cff" .. StatusHex(STATUS.ADDED) .. "Added|r",
+        { headerLeft = 220, headerRight = 220 + 196, scrollLeft = 220, scrollRight = 220 + 196 - 18 })
+
+    -- Vertical divider between the two columns.
+    local divider = panel:CreateTexture(nil, "ARTWORK")
+    divider:SetColorTexture(1, 1, 1, 0.15)
+    divider:SetWidth(1)
+    divider:SetPoint("TOP",    panel, "TOP",    0, -50)
+    divider:SetPoint("BOTTOM", panel, "BOTTOM", 0,  12)
+    panel.divider = divider
+
+    -- Empty-state placeholders, one per column.
+    panel.leftCol.empty = panel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    panel.leftCol.empty:SetPoint("CENTER", panel.leftCol.scroll, "CENTER", 0, 0)
+    panel.leftCol.empty:SetText("Nothing removed.")
+    panel.leftCol.empty:Hide()
+
+    panel.rightCol.empty = panel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    panel.rightCol.empty:SetPoint("CENTER", panel.rightCol.scroll, "CENTER", 0, 0)
+    panel.rightCol.empty:SetText("Nothing added.")
+    panel.rightCol.empty:Hide()
+
+    diffListPanel = panel
+    return panel
+end
+
+-- Convert the diff into two parallel column lists. Each entry carries the
+-- nodeID (so hover tooltips can call AppendTooltipForNode) and a side-specific
+-- spellID/icon/name so the row renders the right talent on each column.
+local function PartitionDiffIntoColumns()
+    local rows = BuildDiffRowList()
+    local left, right = {}, {}
+    for _, r in ipairs(rows) do
+        if r.status == STATUS.ADDED then
+            right[#right + 1] = {
+                side = "added", nodeID = r.nodeID,
+                icon = r.icon, spellID = r.spellID, name = r.name,
+            }
+        elseif r.status == STATUS.REMOVED then
+            left[#left + 1] = {
+                side = "removed", nodeID = r.nodeID,
+                icon = r.icon, spellID = r.spellID, name = r.name,
+            }
+        elseif r.status == STATUS.CHANGED then
+            -- Split across columns: old → REMOVED side, new → ADDED side.
+            -- The row-data alt* fields hold the "old" copy; primary fields hold "new".
+            left[#left + 1] = {
+                side = "removed", nodeID = r.nodeID,
+                icon = r.altIcon, spellID = r.altSpellID, name = r.altName or "?",
+            }
+            right[#right + 1] = {
+                side = "added", nodeID = r.nodeID,
+                icon = r.icon, spellID = r.spellID, name = r.name or "?",
+            }
+        end
+        -- RANK rows are intentionally omitted from the column lists; rank-only
+        -- deltas remain visible in the header counts and on the tree overlay.
+    end
+    local function byName(a, b) return (a.name or "") < (b.name or "") end
+    table.sort(left, byName)
+    table.sort(right, byName)
+    return left, right
+end
+
+local function LayoutColumn(column, entries)
+    for i, entry in ipairs(entries) do
+        local row = GetOrCreateColumnRow(column, i)
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT",  column.content, "TOPLEFT",  0, -((i - 1) * (ROW_HEIGHT + ROW_GAP_Y)))
+        row:SetPoint("TOPRIGHT", column.content, "TOPRIGHT", 0, -((i - 1) * (ROW_HEIGHT + ROW_GAP_Y)))
+        ApplyColumnRow(row, entry)
+    end
+    for i = #entries + 1, #column.rows do
+        column.rows[i]:Hide()
+    end
+    local total = #entries * (ROW_HEIGHT + ROW_GAP_Y)
+    column.content:SetHeight(math.max(total, 1))
+    column.content:SetWidth(column.scroll:GetWidth())
+    if #entries == 0 then column.empty:Show() else column.empty:Hide() end
+end
+
+local function RebuildDiffRows()
+    if not diffListPanel then return end
+    local left, right = PartitionDiffIntoColumns()
+    LayoutColumn(diffListPanel.leftCol,  left)
+    LayoutColumn(diffListPanel.rightCol, right)
+end
+
+function TalentDiff:UpdateDiffPanel()
+    if not diffListPanel or not diffListPanel:IsShown() then return end
+    if not self.state.compareConfigID then
+        diffListPanel:Hide()
+        return
+    end
+    local diff = self:GetDiff()
+    local s = diff and diff.summary or nil
+    if s and diffListPanel.counts then
+        diffListPanel.counts:SetFormattedText(
+            "|cff%s+%d|r  |cff%s-%d|r  |cff%s~%d|r",
+            StatusHex(STATUS.ADDED),   s.added   or 0,
+            StatusHex(STATUS.REMOVED), s.removed or 0,
+            StatusHex(STATUS.CHANGED), s.changed or 0)
+    end
+    RebuildDiffRows()
+end
+
+function TalentDiff:ToggleDiffPanel()
+    EnsureDiffPanel()
+    if diffListPanel:IsShown() then
+        diffListPanel:Hide()
+    else
+        if not self.state.compareConfigID then return end
+        diffListPanel:Show()
+        self:UpdateDiffPanel()
+    end
+end
+
 -- ---------- Tooltip hook ---------------------------------------------------
 
-local function AppendTooltipForNode(tooltip, nodeID)
+function AppendTooltipForNode(tooltip, nodeID)
     local nd = TalentDiff:GetNodeDiff(nodeID)
     if not nd then return end
     local visual = STATUS_VISUAL[nd.status]
     if not visual then return end
 
+    -- Prefix hex is sourced from STATUS_VISUAL via StatusHex so palette tweaks
+    -- in one place propagate to both overlays and tooltip text.
     tooltip:AddLine(" ")
     if nd.status == STATUS.ADDED then
-        tooltip:AddLine("|cff44ff66TalentDiff:|r Will be added by compared loadout"
+        tooltip:AddLine("|cff" .. StatusHex(STATUS.ADDED) .. "TalentDiff:|r Will be added by compared loadout"
             .. ((nd.savedName and (" — " .. nd.savedName)) or ""), 1, 1, 1)
     elseif nd.status == STATUS.REMOVED then
-        tooltip:AddLine("|cffff5555TalentDiff:|r Will be removed by compared loadout"
+        tooltip:AddLine("|cff" .. StatusHex(STATUS.REMOVED) .. "TalentDiff:|r Will be removed by compared loadout"
             .. ((nd.currentName and (" — " .. nd.currentName)) or ""), 1, 1, 1)
     elseif nd.status == STATUS.CHANGED then
-        tooltip:AddLine("|cffffbb33TalentDiff:|r Compared loadout picks "
+        tooltip:AddLine("|cff" .. StatusHex(STATUS.CHANGED) .. "TalentDiff:|r Compared loadout picks "
             .. (nd.savedName or "?") .. " (current: " .. (nd.currentName or "?") .. ")", 1, 1, 1)
     elseif nd.status == STATUS.RANK then
-        tooltip:AddLine(string.format("|cff88ccffTalentDiff:|r Compared loadout changes rank %d \194\187 %d",
-            nd.currentRank or 0, nd.savedRank or 0), 1, 1, 1)
+        tooltip:AddLine(string.format("|cff%sTalentDiff:|r Compared loadout changes rank %d \194\187 %d",
+            StatusHex(STATUS.RANK), nd.currentRank or 0, nd.savedRank or 0), 1, 1, 1)
     end
     tooltip:Show()
 end
@@ -487,6 +1012,7 @@ local function HookTalentFrame()
         for button in IterTalentButtons(talentFrame) do
             ReleaseOverlay(button)
         end
+        if diffListPanel then diffListPanel:Hide() end
     end)
 
     -- Hook updates that re-layout buttons (rank changes, refunds, switches).
@@ -530,6 +1056,11 @@ local function ArmDeferredHook()
 end
 
 function TalentDiff:OnInit()
+    -- SavedVariablesPerCharacter — populated by the engine before our
+    -- ADDON_LOADED fires. Seed missing fields so first-run defaults are sane.
+    TalentDiffDB = TalentDiffDB or {}
+    TalentDiffDB.panel = TalentDiffDB.panel or {}
+
     -- Blizzard's PlayerSpellsFrame lives in the Blizzard_PlayerSpells addon.
     -- Wait for it to load, then arm the deferred hook on its first OnShow.
     if C_AddOns.IsAddOnLoaded("Blizzard_PlayerSpells") then
