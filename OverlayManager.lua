@@ -17,8 +17,10 @@ local TalentDiff = TalentDiff
 
 -- Per-status visual descriptors. Indexed by TalentDiff.STATUS value.
 --   color      : rim tint (also feeds StatusHex / tooltip / panel via GetVisual)
---   rimAlpha   : alpha applied to the shape-matched rim atlas (primary path)
---   rimPad     : px the rim extends beyond the button rect (outward feel)
+--   rimAlpha   : alpha applied to the mask-clipped silhouette outer layer
+--   rimPad     : px the outer mask layer extends beyond the button rect — this
+--                is what produces the visible rim band, since the inner MOD
+--                cutout is sized to the button rect itself.
 --   desaturate : whether to dim the underlying icon (REMOVED "loss" feel)
 --   glowAlpha  : LEGACY — alpha for the hollow-circle halo in fallback path
 --   glowPad    : LEGACY — outward pad for the halo in fallback path
@@ -77,34 +79,75 @@ local function GetNodeShape(button)
     return "circle"
 end
 
--- Resolve a Blizzard atlas name for a given shape, validated once via
--- C_Texture.GetAtlasInfo so a renamed-or-removed atlas on a future patch
--- silently falls back to the legacy treatment instead of rendering broken.
--- Cache stores false for "tried and missing" so we don't poll every paint.
-local RIM_ATLAS_CANDIDATES = {
-    circle = { "talents-node-circle-yellow", "talents-node-pvptalent-yellow" },
-    choice = { "talents-node-choice-yellow", "talents-node-choiceflyout-square-yellow" },
+-- The rim itself is a Blizzard atlas that is *already* hollow ring art —
+-- transparent center, edge-only pixels. The mask just clips the rim's outer
+-- silhouette to the exact node shape. The atlas provides the ring; the mask
+-- provides silhouette truth. No subtraction, no MOD blending, no full-rect
+-- color fills — just one tinted hollow texture clipped to the node shape.
+local RIM_ATLAS = {
+    circle = "talents-node-circle-yellow",
+    choice = "talents-node-choice-yellow",
 }
-local rimAtlasCache = {}
-local function ResolveRimAtlas(shape)
+
+-- Resolve a Blizzard MASK TEXTURE PATH for a given node shape. Masks are the
+-- geometric source of truth Blizzard uses to clip its own talent-node art, so
+-- using them here guarantees overlay silhouette = node silhouette across every
+-- resolution and UI scale. SetMask takes a texture file path (not an atlas
+-- name), so candidates are full Interface\... paths.
+--
+-- Validation strategy: there is no GetMaskInfo API, and SetMask itself is
+-- silent on failure. We probe each candidate via a hidden offscreen texture's
+-- SetMask call and accept the first that doesn't throw; result cached per
+-- shape. If no candidate resolves we still attempt to paint with no mask —
+-- the atlas is already hollow, so an unmasked rim still reads as a ring,
+-- just without silhouette-perfect outer clipping.
+local MASK_CANDIDATES = {
+    circle = {
+        "Interface\\TalentFrame\\TalentsMaskNodeCircle\\talents-node-circle-mask",
+        "Interface\\TalentFrame\\TalentsMaskApexNodeLargeCircle\\talents-node-apex-large-mask",
+        "Interface\\TalentFrame\\TalentsMaskApexNodeSmallCircle\\talents-node-apex-small-mask",
+    },
+    choice = {
+        "Interface\\TalentFrame\\TalentsMaskNodeChoice\\talents-node-choice-mask",
+        "Interface\\TalentFrame\\TalentsMaskApexNodeLargeSquare\\talents-node-apex-active-large-mask",
+        "Interface\\TalentFrame\\TalentsMaskNodeChoiceFlyout\\talents-node-choiceflyout-mask",
+    },
+}
+local maskCache = {}
+local maskProbeFrame, maskProbeTex
+local function getMaskProbe()
+    if maskProbeTex then return maskProbeTex end
+    maskProbeFrame = CreateFrame("Frame", nil, UIParent)
+    maskProbeFrame:Hide()
+    maskProbeTex = maskProbeFrame:CreateTexture(nil, "BACKGROUND")
+    maskProbeTex:SetColorTexture(1, 1, 1, 1)
+    return maskProbeTex
+end
+local function ResolveMaskPath(shape)
     if not shape then return nil end
-    local cached = rimAtlasCache[shape]
+    local cached = maskCache[shape]
     if cached ~= nil then
         return cached or nil
     end
-    local getInfo = C_Texture and C_Texture.GetAtlasInfo
-    if not getInfo then
-        rimAtlasCache[shape] = false
+    local probe = getMaskProbe()
+    if not probe or not probe.SetMask then
+        maskCache[shape] = false
         return nil
     end
-    for _, name in ipairs(RIM_ATLAS_CANDIDATES[shape] or {}) do
-        local ok, info = pcall(getInfo, name)
-        if ok and info then
-            rimAtlasCache[shape] = name
-            return name
+    for _, path in ipairs(MASK_CANDIDATES[shape] or {}) do
+        -- SetMask is silent on missing assets, but pcall guards the rare case
+        -- where the API itself errors on a malformed path. Any mask that loads
+        -- without throwing is treated as usable; if the file is missing the
+        -- mask simply has no effect, which is no worse than the fallback path.
+        local ok = pcall(probe.SetMask, probe, path)
+        if ok then
+            -- Clear the probe so it doesn't carry state into the next probe call.
+            pcall(probe.SetMask, probe, nil)
+            maskCache[shape] = path
+            return path
         end
     end
-    rimAtlasCache[shape] = false
+    maskCache[shape] = false
     return nil
 end
 
@@ -119,11 +162,18 @@ local function GetOrCreate(self, button)
     ov:SetFrameLevel((button:GetFrameLevel() or 1) + 7)
     ov:SetAllPoints(button)
 
-    -- Primary visual: shape-matched Blizzard rim atlas tinted to status color.
-    -- Lives on BACKGROUND/-2 so it sits behind the icon's own border art but in
-    -- front of the talent tree backdrop — the rim "embraces" the node silhouette
-    -- rather than covering it. SetAtlas is deferred to paint time (the atlas is
-    -- chosen per-button by shape and validated lazily).
+    -- Primary visual: a single mask-clipped hollow rim.
+    --
+    -- The rim texture is a Blizzard talent-node atlas that is ALREADY edge-only
+    -- art (transparent center, ring-shaped pixels). At paint time we:
+    --   * SetAtlas(talents-node-{circle,choice}-yellow) — hollow ring shape
+    --   * SetVertexColor(r,g,b,a) — tint to status color
+    --   * SetMask(blizzard mask path) — clip outer silhouette to node geometry
+    --   * BlendMode ADD — purely additive glow over the tree backdrop
+    --
+    -- No second layer. No subtraction. No color fills behind the icon. The
+    -- atlas's own transparent interior is what produces the hollow rim; the
+    -- mask only enforces silhouette correctness.
     local rim = ov:CreateTexture(nil, "BACKGROUND", nil, -2)
     rim:SetBlendMode("ADD")
     rim:Hide()
@@ -191,10 +241,6 @@ end
 
 -- ---------- paint helpers --------------------------------------------------
 
-local function SetEdgesColor(ov, r, g, b, a)
-    for _, e in pairs(ov.edges) do e:SetVertexColor(r, g, b, a or 1) end
-end
-
 local function SetEdgesShown(ov, shown)
     for _, e in pairs(ov.edges) do
         if shown then e:Show() else e:Hide() end
@@ -243,53 +289,53 @@ local function PaintRank(ov, button, nodeDiff)
     ov.delta:Show()
 end
 
--- Add/removed/changed: paint a single shape-matched Blizzard rim atlas tinted
--- to status color. The rim follows the node silhouette so the overlay reads as
--- "this node is in state X" rather than a colored box on top.
+-- Add/removed/changed: paint a hollow Blizzard rim atlas, tinted to status
+-- color, clipped to the node silhouette by a Blizzard mask texture.
 --
--- If the atlas can't be resolved (patch drift, unknown node type), fall back to
--- the legacy strip+halo treatment so the addon never renders blank.
+-- The atlas (talents-node-{circle,choice}-yellow) is already edge-only ring
+-- art with a transparent interior — that's what produces the hollow look.
+-- The mask (talents-node-*-mask) enforces that the rim's outer boundary
+-- matches the actual node silhouette, including apex / sub-tree variants.
+--
+-- Single layer, ADD blend, no subtraction tricks. If the shape is unknown or
+-- the atlas can't be set, the rim stays hidden — we never fall back to a
+-- rectangular fill, since rectangular fills are the bug we're correcting.
 local function PaintStructural(ov, button, visual)
     local r, g, b = visual.color[1], visual.color[2], visual.color[3]
     local shape = GetNodeShape(button)
-    local atlas = ResolveRimAtlas(shape)
+    local atlasName = shape and RIM_ATLAS[shape] or nil
+    local maskPath = ResolveMaskPath(shape)
 
-    if atlas then
+    -- Always hide legacy fallback geometry — strip / halo / shade are no
+    -- longer used. They remain in GetOrCreate only to avoid disturbing other
+    -- code paths that reference ov.glow / ov.shade / ov.edges; left hidden
+    -- here so they never contribute to the visual.
+    SetEdgesShown(ov, false)
+    ov.glow:Hide()
+    ov.shade:Hide()
+
+    if atlasName then
         local pad = visual.rimPad or 0
         ov.rim:ClearAllPoints()
         ov.rim:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
         ov.rim:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
-        ov.rim:SetAtlas(atlas)
-        ov.rim:SetVertexColor(r, g, b, visual.rimAlpha or 0.8)
-        ov.rim:Show()
 
-        SetEdgesShown(ov, false)
-        ov.glow:Hide()
-        ov.shade:Hide()
+        local okAtlas = pcall(ov.rim.SetAtlas, ov.rim, atlasName)
+        if okAtlas then
+            -- Apply mask AFTER SetAtlas so the atlas's UVs are established
+            -- before clipping; clear any prior mask first to avoid stale state
+            -- on a recycled button whose previous shape differed.
+            pcall(ov.rim.SetMask, ov.rim, nil)
+            if maskPath then
+                pcall(ov.rim.SetMask, ov.rim, maskPath)
+            end
+            ov.rim:SetVertexColor(r, g, b, visual.rimAlpha or 0.8)
+            ov.rim:Show()
+        else
+            ov.rim:Hide()
+        end
     else
-        -- Legacy fallback path. Preserves the prior visual contract exactly so
-        -- behavior is unchanged on clients where atlases can't resolve.
         ov.rim:Hide()
-        SetEdgesColor(ov, r, g, b, 1)
-        SetEdgesShown(ov, true)
-
-        if shape == "circle" and (visual.glowAlpha or 0) > 0 then
-            local pad = visual.glowPad
-            ov.glow:ClearAllPoints()
-            ov.glow:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
-            ov.glow:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
-            ov.glow:SetVertexColor(r, g, b, visual.glowAlpha)
-            ov.glow:Show()
-        else
-            ov.glow:Hide()
-        end
-
-        if (visual.shadeAlpha or 0) > 0 then
-            ov.shade:SetVertexColor(0, 0, 0, visual.shadeAlpha)
-            ov.shade:Show()
-        else
-            ov.shade:Hide()
-        end
     end
 
     ApplyIconDesaturate(ov, button, visual.desaturate == true)
