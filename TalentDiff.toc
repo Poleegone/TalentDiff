@@ -2,7 +2,7 @@
 ## Title: TalentDiff
 ## Notes: Visual diff layer for Blizzard talent loadouts
 ## Author: Nosebug
-## Version: 1.1.0
+## Version: 1.1.2
 ## X-Curse-Project-ID: 1535944
 ## X-Wago-ID: qKQma1Kx
 ## SavedVariablesPerCharacter: TalentDiffDB
