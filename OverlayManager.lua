@@ -17,6 +17,9 @@ local TalentDiff = TalentDiff
 
 -- Per-status visual descriptors. Indexed by TalentDiff.STATUS value.
 --   color      : rim tint (also feeds StatusHex / tooltip / panel via GetVisual)
+--                ↑ EDIT HERE to change red/green saturation; values are
+--                  normalized RGBA 0..1. Push the off-channels (red+blue for
+--                  green; green+blue for red) toward 0 to increase saturation.
 --   rimAlpha   : alpha applied to the mask-clipped silhouette outer layer
 --   rimPad     : px the outer mask layer extends beyond the button rect — this
 --                is what produces the visible rim band, since the inner MOD
@@ -26,15 +29,16 @@ local TalentDiff = TalentDiff
 --   glowPad    : LEGACY — outward pad for the halo in fallback path
 --   shadeAlpha : LEGACY — inward black shade in fallback path
 local STATUS_VISUAL = {
-    [1] = { color = {0.30, 1.00, 0.45, 1.00}, rimAlpha = 0.85, rimPad = 5, desaturate = false, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED
-    [2] = { color = {1.00, 0.18, 0.22, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = true,  glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.30 }, -- REMOVED
+    [1] = { color = {0.10, 1.00, 0.25, 1.00}, rimAlpha = 0.85, rimPad = 5, desaturate = false, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED   (saturated green)
+    [2] = { color = {1.00, 0.08, 0.12, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = true,  glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.30 }, -- REMOVED (saturated red)
     [3] = { color = {1.00, 0.78, 0.18, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = false, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
     [4] = { color = {0.50, 0.82, 1.00, 1.00}, rimAlpha = 0,    rimPad = 0, desaturate = false, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
 }
 
--- Punchier than the prior values so +N / -N reads against icon sheen.
-local DELTA_POS_RGB = {0.30, 1.00, 0.45}
-local DELTA_NEG_RGB = {1.00, 0.30, 0.30}
+-- Delta label colors mirror the rim hues so +N / -N stays visually coherent
+-- with the rim it sits next to. Same saturation lever as STATUS_VISUAL.color.
+local DELTA_POS_RGB = {0.10, 1.00, 0.25}
+local DELTA_NEG_RGB = {1.00, 0.20, 0.22}
 
 -- Verified-existing retail textures. WHITE8x8 builds the thin per-side outline strips
 -- and (tinted black) the inward REMOVED shade; IconBorder-GlowRing is a clean hollow
@@ -103,78 +107,57 @@ local function NormalizedShapeFromString(s)
     return nil
 end
 
--- Resolve a button's visual shape by reading its live atlas regions.
+-- Atlas-driven shape classifier. Reads `StateBorder:GetAtlas()` first — that's
+-- Blizzard's authoritative shape ring — then falls back through a small
+-- whitelist of regions that carry the same shape art on templates where
+-- StateBorder is absent. Shadow / Ghost are deliberately NOT consulted: apex
+-- nodes carry a circle Shadow atlas, which produced the apex-as-circle bug.
 --
--- Region priority — STRICT ORDER, not a `pairs()` walk:
---   1. StateBorder        — Blizzard's authoritative shape ring (the colored
---                            outer border that defines the visible silhouette)
---   2. StateBorderHover   — same shape as StateBorder, used on mouseover
---   3. Glow / SelectableGlow — shape-matched glow art
---   4. Border             — fallback art name some templates use
---   5. Shadow             — DELIBERATELY DEPRIORITIZED. Apex nodes carry a
---                            circle Shadow even though their actual shape is
---                            apex-large; trusting Shadow first was the bug
---                            that mis-classified apex nodes as circles.
---   6. Ghost              — last resort; sometimes correct, sometimes reused.
+-- Per-button cache keyed by the atlas string short-circuits repeat reads when
+-- Blizzard recycles a button frame for the same node — `_tdShapeAtlas` holds
+-- the atlas we last classified, `_tdShape` / `_tdShapeKey` hold the result.
 --
--- Returns: shape, srcKey (region:atlas — diagnostics), srcVal (atlas string)
+-- Returns: shape, srcKey (region the atlas came from), srcVal (atlas string)
 local SHAPE_REGION_PRIORITY = {
     "StateBorder",
     "StateBorderHover",
     "Glow",
     "SelectableGlow",
     "Border",
-    "Shadow",
-    "Ghost",
 }
 
-local function ResolveShapeFromNodeVisuals(button)
+local function ReadRegionAtlas(button, key)
+    local v = button[key]
+    if type(v) ~= "table" or type(v.GetAtlas) ~= "function" then return nil end
+    local okT, ot = pcall(v.GetObjectType, v)
+    if not okT or ot ~= "Texture" then return nil end
+    local okA, atlas = pcall(v.GetAtlas, v)
+    if okA and type(atlas) == "string" and atlas ~= "" then return atlas end
+    return nil
+end
+
+local function ResolveShapeFromAtlas(button)
     if not button then return nil, nil, nil end
-
-    local function probeRegion(key)
-        local v = button[key]
-        if type(v) ~= "table" or type(v.GetObjectType) ~= "function" then return nil end
-        local okT, ot = pcall(v.GetObjectType, v)
-        if not okT or ot ~= "Texture" then return nil end
-        if v.GetAtlas then
-            local okA, atlas = pcall(v.GetAtlas, v)
-            if okA and atlas and atlas ~= "" then
-                local s = NormalizedShapeFromString(atlas)
-                if s then return s, key .. ":atlas", atlas end
-            end
-        end
-        if v.GetTexture then
-            local okTx, tex = pcall(v.GetTexture, v)
-            if okTx and type(tex) == "string" and tex ~= "" then
-                local s = NormalizedShapeFromString(tex)
-                if s then return s, key .. ":texture", tex end
-            end
-        end
-        return nil
-    end
-
-    -- 1. Strict-priority region scan.
     for _, key in ipairs(SHAPE_REGION_PRIORITY) do
-        local s, srcKey, srcVal = probeRegion(key)
-        if s then return s, srcKey, srcVal end
-    end
-
-    -- 2. Last-resort: scan any other Texture child that we haven't already
-    -- probed. Keeps us robust against future Blizzard renames where the
-    -- shape signal moves to a region not in SHAPE_REGION_PRIORITY.
-    for k in pairs(button) do
-        if type(k) == "string" then
-            local alreadyProbed = false
-            for _, pk in ipairs(SHAPE_REGION_PRIORITY) do
-                if pk == k then alreadyProbed = true; break end
+        local atlas = ReadRegionAtlas(button, key)
+        if atlas then
+            -- Cache hit: same atlas as last paint → reuse classification.
+            if button._tdShapeAtlas == atlas and button._tdShape then
+                return button._tdShape, button._tdShapeKey, atlas
             end
-            if not alreadyProbed then
-                local s, srcKey, srcVal = probeRegion(k)
-                if s then return s, srcKey, srcVal end
+            local s = NormalizedShapeFromString(atlas)
+            if s then
+                button._tdShapeAtlas = atlas
+                button._tdShape      = s
+                button._tdShapeKey   = key
+                return s, key, atlas
             end
+            -- Atlas was readable but didn't match any known shape token —
+            -- don't keep walking; StateBorder is authoritative. Returning nil
+            -- here surfaces the unknown atlas via the rate-limited warning.
+            return nil, key, atlas
         end
     end
-
     return nil, nil, nil
 end
 
@@ -515,13 +498,20 @@ end
 -- gameplay metadata and lies about the rendered geometry (apex nodes have
 -- info.type=0/1, but Blizzard renders them with apex atlases).
 --
+-- ANCHORING: the rim is anchored to `button.StateBorder` (Blizzard's visible
+-- shape ring) when present, NOT to the button frame. This matters for apex
+-- nodes whose hit-target frame is significantly larger than the visible art —
+-- anchoring to the frame would inset the masked rim within the apex octagon.
+-- Anchoring to StateBorder ties the rim to the same rectangle the mask was
+-- authored against, so the silhouette aligns at any UI scale.
+--
 -- If the visual classifier can't determine a shape, the rim is hidden and a
 -- one-shot warning fires — never a circle fallback, never a rectangular
 -- fallback. Visible-broken beats silently-wrong.
 local function PaintStructural(ov, button, visual)
     local r, g, b = visual.color[1], visual.color[2], visual.color[3]
 
-    local visualShape, visualSrcKey, visualSrcVal = ResolveShapeFromNodeVisuals(button)
+    local visualShape, visualSrcKey, visualSrcVal = ResolveShapeFromAtlas(button)
     local gameplayShape, info = GetNodeShape(button)  -- diagnostics only
 
     local atlasName = visualShape and RIM_ATLAS[visualShape] or nil
@@ -542,11 +532,12 @@ local function PaintStructural(ov, button, visual)
     -- distinguish "API errored" from "atlas missing".
     local atlasOk, maskOk
     local pad = visual.rimPad or 0
+    local anchorTo = button.StateBorder or button
 
     if atlasName then
         ov.rim:ClearAllPoints()
-        ov.rim:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
-        ov.rim:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
+        ov.rim:SetPoint("TOPLEFT",     anchorTo, "TOPLEFT",     -pad,  pad)
+        ov.rim:SetPoint("BOTTOMRIGHT", anchorTo, "BOTTOMRIGHT",  pad, -pad)
 
         local pcallOk, found = pcall(function() return ov.rim:SetAtlas(atlasName) end)
         atlasOk = pcallOk and (found ~= false)  -- SetAtlas returns false when atlas missing; nil/true otherwise
@@ -607,6 +598,30 @@ local function PaintStructural(ov, button, visual)
             tostring(gameplayShape),
             tostring(atlasName), tostring(atlasOk),
             tostring(maskPath), tostring(maskOk))
+
+        -- Geometry triplet. Reveals whether the button's hit-target frame and
+        -- the visible StateBorder rectangle differ (the apex inset suspect),
+        -- and confirms the rim ended up sized to the right rectangle. Empty
+        -- "?x?" entries usually mean the texture has no points set yet on a
+        -- freshly recycled button — re-running /td debug after the talent
+        -- frame has been visible for a moment will populate them.
+        local function fmtSize(o)
+            if not o or type(o.GetSize) ~= "function" then return "?" end
+            local okS, w, h = pcall(o.GetSize, o)
+            if not okS or not w or not h then return "?" end
+            return string.format("%.0fx%.0f", w, h)
+        end
+        local sb = button.StateBorder
+        local sbAnchor = "?"
+        if sb and type(sb.GetPoint) == "function" then
+            local okP, point, _, relPoint, x, y = pcall(sb.GetPoint, sb, 1)
+            if okP and point then
+                sbAnchor = string.format("%s->%s @%.0f,%.0f", tostring(point), tostring(relPoint), x or 0, y or 0)
+            end
+        end
+        buf[#buf + 1] = string.format("  sizes: button=%s stateBorder=%s (%s) rim=%s anchorTo=%s",
+            fmtSize(button), fmtSize(sb), sbAnchor, fmtSize(ov.rim),
+            (button.StateBorder and "StateBorder") or "button")
         buf[#buf + 1] = "  regions: " .. DumpButtonRegions(button)
     end
 
