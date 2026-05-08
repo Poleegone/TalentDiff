@@ -58,6 +58,19 @@ OverlayManager.pool = setmetatable({}, { __mode = "k" })
 OverlayManager.activeButtons = {}
 OverlayManager.generation = 0
 
+-- One-shot diagnostic. /td debug flips this true; the next paint pass
+-- collects per-button classification + atlas/mask binding into the buffer,
+-- and RefreshAll's tail flushes the buffer into TalentDiff:ShowDebugLog (a
+-- copyable scrollable window) so the user can Ctrl+A / Ctrl+C the result.
+-- Chat is unsuitable for this dump because WoW's chat frame is not copyable.
+OverlayManager.diagnoseOnce = false
+OverlayManager._diagnoseBuffer = nil  -- set to {} when diagnoseOnce is armed
+
+-- Session-scoped rate-limit sets so per-node warnings only fire once each
+-- (chat would otherwise get hammered on every refresh / event-driven paint).
+OverlayManager._warnedShape = {}  -- nodeID → true (unknown-shape warned)
+OverlayManager._warnedAtlas = {}  -- (nodeID .. "/" .. atlasName) → true
+
 -- ---------- visual lookup --------------------------------------------------
 
 function OverlayManager:GetVisual(statusIdx)
@@ -66,17 +79,185 @@ end
 
 -- ---------- node-shape classification --------------------------------------
 
+-- Map a `talents-node-*` atlas/texture name to a normalized shape token.
+-- Pattern order matters — `choiceflyout` must be checked before `choice`,
+-- and `apex` is a single bucket regardless of -large / -small variants.
+--
+-- The strings we care about come from atlas names like
+-- `talents-node-apex-large-gray` / `talents-node-square-yellow` /
+-- `talents-node-circle-shadow`. We match case-insensitively.
+local function NormalizedShapeFromString(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    s = s:lower()
+    if not s:find("talents%-node") and not s:find("talents\\node") then
+        return nil
+    end
+    if s:find("choiceflyout")               then return "choiceflyout" end
+    if s:find("apex")                       then return "apex"         end
+    if s:find("subtree") or s:find("sub%-tree") or s:find("hero")
+                                            then return "subtree"      end
+    if s:find("choice")                     then return "choice"       end
+    if s:find("square")                     then return "square"       end
+    if s:find("pvptalent")                  then return "circle"       end
+    if s:find("circle")                     then return "circle"       end
+    return nil
+end
+
+-- Resolve a button's visual shape by reading its live atlas regions.
+--
+-- Region priority — STRICT ORDER, not a `pairs()` walk:
+--   1. StateBorder        — Blizzard's authoritative shape ring (the colored
+--                            outer border that defines the visible silhouette)
+--   2. StateBorderHover   — same shape as StateBorder, used on mouseover
+--   3. Glow / SelectableGlow — shape-matched glow art
+--   4. Border             — fallback art name some templates use
+--   5. Shadow             — DELIBERATELY DEPRIORITIZED. Apex nodes carry a
+--                            circle Shadow even though their actual shape is
+--                            apex-large; trusting Shadow first was the bug
+--                            that mis-classified apex nodes as circles.
+--   6. Ghost              — last resort; sometimes correct, sometimes reused.
+--
+-- Returns: shape, srcKey (region:atlas — diagnostics), srcVal (atlas string)
+local SHAPE_REGION_PRIORITY = {
+    "StateBorder",
+    "StateBorderHover",
+    "Glow",
+    "SelectableGlow",
+    "Border",
+    "Shadow",
+    "Ghost",
+}
+
+local function ResolveShapeFromNodeVisuals(button)
+    if not button then return nil, nil, nil end
+
+    local function probeRegion(key)
+        local v = button[key]
+        if type(v) ~= "table" or type(v.GetObjectType) ~= "function" then return nil end
+        local okT, ot = pcall(v.GetObjectType, v)
+        if not okT or ot ~= "Texture" then return nil end
+        if v.GetAtlas then
+            local okA, atlas = pcall(v.GetAtlas, v)
+            if okA and atlas and atlas ~= "" then
+                local s = NormalizedShapeFromString(atlas)
+                if s then return s, key .. ":atlas", atlas end
+            end
+        end
+        if v.GetTexture then
+            local okTx, tex = pcall(v.GetTexture, v)
+            if okTx and type(tex) == "string" and tex ~= "" then
+                local s = NormalizedShapeFromString(tex)
+                if s then return s, key .. ":texture", tex end
+            end
+        end
+        return nil
+    end
+
+    -- 1. Strict-priority region scan.
+    for _, key in ipairs(SHAPE_REGION_PRIORITY) do
+        local s, srcKey, srcVal = probeRegion(key)
+        if s then return s, srcKey, srcVal end
+    end
+
+    -- 2. Last-resort: scan any other Texture child that we haven't already
+    -- probed. Keeps us robust against future Blizzard renames where the
+    -- shape signal moves to a region not in SHAPE_REGION_PRIORITY.
+    for k in pairs(button) do
+        if type(k) == "string" then
+            local alreadyProbed = false
+            for _, pk in ipairs(SHAPE_REGION_PRIORITY) do
+                if pk == k then alreadyProbed = true; break end
+            end
+            if not alreadyProbed then
+                local s, srcKey, srcVal = probeRegion(k)
+                if s then return s, srcKey, srcVal end
+            end
+        end
+    end
+
+    return nil, nil, nil
+end
+
+-- Walk button regions and return a flat list of `key={atlas=…,tex=…}` entries
+-- for any region that has either an atlas or a texture path. Used by the
+-- /td debug diagnostic so the user can SEE what regions Blizzard exposes per
+-- node, which is how we extend the visual classifier when new shapes appear.
+local function DumpButtonRegions(button)
+    if not button then return "" end
+    local out = {}
+    for k, v in pairs(button) do
+        if type(v) == "table" and type(v.GetObjectType) == "function" then
+            local ok, objType = pcall(v.GetObjectType, v)
+            if ok and objType == "Texture" then
+                local atlas, tex
+                if v.GetAtlas then
+                    local okA, a = pcall(v.GetAtlas, v)
+                    if okA then atlas = a end
+                end
+                if v.GetTexture then
+                    local okT, t = pcall(v.GetTexture, v)
+                    if okT then tex = t end
+                end
+                if (atlas and atlas ~= "") or (tex and tex ~= "" and type(tex) == "string") then
+                    out[#out + 1] = string.format("%s={atlas=%s,tex=%s}", tostring(k), tostring(atlas), tostring(tex))
+                end
+            end
+        end
+    end
+    if #out == 0 then return "(no Texture regions found)" end
+    return table.concat(out, " ")
+end
+
 -- Classify a button as "circle" (passive talents — circular icons in Blizzard's
 -- talent UI), "choice" (Selection + SubTreeSelection — octagonal in Blizzard's
--- UI), or nil (unknown / API unavailable). Used to pick a shape-matched rim
--- atlas; falls back to legacy strip+halo treatment when nil.
+-- UI), or nil (unknown — caller MUST NOT paint a rim). Semantic-only fallback
+-- for ResolveShapeFromNodeVisuals — used when the button has no readable
+-- talents-node-* atlas region.
+--
+-- Multi-signal detection in priority order. The previous "anything not
+-- explicitly choice → circle" fall-through was the root cause of the all-
+-- circles-rendered-on-octagonal-nodes regression: when GetNodeInfo or the
+-- enum compare quietly mismatched, every node fell through to "circle". The
+-- new contract is: if we can't prove the shape, return nil and let the
+-- caller hide the rim + log a warning. Visible failure beats silent miscolor.
+--
+-- Returns: shape ("circle" | "choice" | nil), info (table or nil for diagnostics)
 local function GetNodeShape(button)
-    if not button or not button.GetNodeInfo then return nil end
-    local ok, info = pcall(button.GetNodeInfo, button)
-    if not ok or not info or not Enum or not Enum.TraitNodeType then return nil end
-    if info.type == Enum.TraitNodeType.Selection then return "choice" end
-    if info.type == Enum.TraitNodeType.SubTreeSelection then return "choice" end
-    return "circle"
+    if not button then return nil, nil end
+
+    local info
+    if button.GetNodeInfo then
+        local ok, result = pcall(button.GetNodeInfo, button)
+        if ok then info = result end
+    end
+
+    -- 1-2. Authoritative info.type match against TraitNodeType enum.
+    if info and Enum and Enum.TraitNodeType then
+        if info.type == Enum.TraitNodeType.SubTreeSelection then return "choice", info end
+        if info.type == Enum.TraitNodeType.Selection then return "choice", info end
+    end
+
+    -- 3. Sub-tree mixin signs: a SubTreeSelectionMixin button typically
+    -- exposes GetSubTreeID or has a non-nil subTreeID. These survive even if
+    -- info.type went sideways on a future patch.
+    if (button.GetSubTreeID and type(button.GetSubTreeID) == "function") or button.subTreeID ~= nil then
+        return "choice", info
+    end
+
+    -- 4. Choice-node mixin signs: the SelectMixin's XML template attaches
+    -- PickedIcon / SelectedIcon textures that don't exist on passive buttons.
+    if button.PickedIcon or button.SelectedIcon then
+        return "choice", info
+    end
+
+    -- 5. Fallback to "circle" ONLY when info.type was readable (i.e. we
+    -- actually have evidence this is a node) AND it didn't match any choice
+    -- value. Without that evidence we fall through to nil — never guess.
+    if info and info.type ~= nil then
+        return "circle", info
+    end
+
+    return nil, info
 end
 
 -- The rim itself is a Blizzard atlas that is *already* hollow ring art —
@@ -84,9 +265,17 @@ end
 -- silhouette to the exact node shape. The atlas provides the ring; the mask
 -- provides silhouette truth. No subtraction, no MOD blending, no full-rect
 -- color fills — just one tinted hollow texture clipped to the node shape.
+-- Shape → rim atlas. Names match Blizzard's `talents-node-<shape>-yellow`
+-- pattern observed in the /td debug regions dump. If any fail to resolve in
+-- the live client, the existing "atlas not found" rate-limited warning will
+-- fire with the exact name and nodeID for follow-up correction.
 local RIM_ATLAS = {
-    circle = "talents-node-circle-yellow",
-    choice = "talents-node-choice-yellow",
+    circle       = "talents-node-circle-yellow",
+    choice       = "talents-node-choice-yellow",
+    square       = "talents-node-square-yellow",
+    apex         = "talents-node-apex-large-yellow",
+    choiceflyout = "talents-node-choiceflyout-yellow",
+    subtree      = "talents-node-subtree-yellow",
 }
 
 -- Resolve a Blizzard MASK TEXTURE PATH for a given node shape. Masks are the
@@ -104,13 +293,23 @@ local RIM_ATLAS = {
 local MASK_CANDIDATES = {
     circle = {
         "Interface\\TalentFrame\\TalentsMaskNodeCircle\\talents-node-circle-mask",
-        "Interface\\TalentFrame\\TalentsMaskApexNodeLargeCircle\\talents-node-apex-large-mask",
-        "Interface\\TalentFrame\\TalentsMaskApexNodeSmallCircle\\talents-node-apex-small-mask",
+    },
+    square = {
+        "Interface\\TalentFrame\\TalentsMaskNodeSquare\\talents-node-square-mask",
     },
     choice = {
         "Interface\\TalentFrame\\TalentsMaskNodeChoice\\talents-node-choice-mask",
+    },
+    apex = {
+        "Interface\\TalentFrame\\TalentsMaskNodeApex\\talents-node-apex-large-mask",
+        "Interface\\TalentFrame\\TalentsMaskApexNodeLargeCircle\\talents-node-apex-large-mask",
         "Interface\\TalentFrame\\TalentsMaskApexNodeLargeSquare\\talents-node-apex-active-large-mask",
+    },
+    choiceflyout = {
         "Interface\\TalentFrame\\TalentsMaskNodeChoiceFlyout\\talents-node-choiceflyout-mask",
+    },
+    subtree = {
+        "Interface\\TalentFrame\\TalentsMaskNodeSubTree\\talents-node-subtree-mask",
     },
 }
 local maskCache = {}
@@ -261,6 +460,19 @@ local function FindIconRegion(button)
     return nil
 end
 
+-- Best-effort nodeID resolver, mirrors UI.lua's GetButtonNodeID. Used only
+-- for diagnostic logging + warning rate-limit keys; never load-bearing.
+local function GetNodeID(button)
+    if not button then return nil end
+    if button.GetNodeID then
+        local ok, id = pcall(button.GetNodeID, button)
+        if ok and id then return id end
+    end
+    if button.nodeID then return button.nodeID end
+    if button.nodeInfo and button.nodeInfo.ID then return button.nodeInfo.ID end
+    return nil
+end
+
 local function ApplyIconDesaturate(ov, button, on)
     if on and not ov._iconDesatRegion then
         local region = FindIconRegion(button)
@@ -292,19 +504,29 @@ end
 -- Add/removed/changed: paint a hollow Blizzard rim atlas, tinted to status
 -- color, clipped to the node silhouette by a Blizzard mask texture.
 --
--- The atlas (talents-node-{circle,choice}-yellow) is already edge-only ring
--- art with a transparent interior — that's what produces the hollow look.
--- The mask (talents-node-*-mask) enforces that the rim's outer boundary
--- matches the actual node silhouette, including apex / sub-tree variants.
+-- The atlas (talents-node-<shape>-yellow) is already edge-only ring art with
+-- a transparent interior — that's what produces the hollow look. The mask
+-- (talents-node-<shape>-mask) clips the rim's outer boundary to the exact
+-- node silhouette Blizzard rendered for this specific button.
 --
--- Single layer, ADD blend, no subtraction tricks. If the shape is unknown or
--- the atlas can't be set, the rim stays hidden — we never fall back to a
--- rectangular fill, since rectangular fills are the bug we're correcting.
+-- AUTHORITATIVE SHAPE = the button's live visual atlas regions, period.
+-- Semantic gameplay shape (info.type) is computed for diagnostics ONLY; it
+-- does not influence rendering, because /td debug proved info.type is
+-- gameplay metadata and lies about the rendered geometry (apex nodes have
+-- info.type=0/1, but Blizzard renders them with apex atlases).
+--
+-- If the visual classifier can't determine a shape, the rim is hidden and a
+-- one-shot warning fires — never a circle fallback, never a rectangular
+-- fallback. Visible-broken beats silently-wrong.
 local function PaintStructural(ov, button, visual)
     local r, g, b = visual.color[1], visual.color[2], visual.color[3]
-    local shape = GetNodeShape(button)
-    local atlasName = shape and RIM_ATLAS[shape] or nil
-    local maskPath = ResolveMaskPath(shape)
+
+    local visualShape, visualSrcKey, visualSrcVal = ResolveShapeFromNodeVisuals(button)
+    local gameplayShape, info = GetNodeShape(button)  -- diagnostics only
+
+    local atlasName = visualShape and RIM_ATLAS[visualShape] or nil
+    local maskPath = ResolveMaskPath(visualShape)
+    local nodeID = GetNodeID(button)
 
     -- Always hide legacy fallback geometry — strip / halo / shade are no
     -- longer used. They remain in GetOrCreate only to avoid disturbing other
@@ -314,20 +536,27 @@ local function PaintStructural(ov, button, visual)
     ov.glow:Hide()
     ov.shade:Hide()
 
+    -- Capture binding outcome for the one-shot diagnostic dump below. We have
+    -- to call SetAtlas inside a pcall AND capture its return value (the actual
+    -- "atlas was found" bool) — wrapping both in one pcall is the only way to
+    -- distinguish "API errored" from "atlas missing".
+    local atlasOk, maskOk
+    local pad = visual.rimPad or 0
+
     if atlasName then
-        local pad = visual.rimPad or 0
         ov.rim:ClearAllPoints()
         ov.rim:SetPoint("TOPLEFT",     ov, "TOPLEFT",     -pad,  pad)
         ov.rim:SetPoint("BOTTOMRIGHT", ov, "BOTTOMRIGHT",  pad, -pad)
 
-        local okAtlas = pcall(ov.rim.SetAtlas, ov.rim, atlasName)
-        if okAtlas then
+        local pcallOk, found = pcall(function() return ov.rim:SetAtlas(atlasName) end)
+        atlasOk = pcallOk and (found ~= false)  -- SetAtlas returns false when atlas missing; nil/true otherwise
+        if atlasOk then
             -- Apply mask AFTER SetAtlas so the atlas's UVs are established
             -- before clipping; clear any prior mask first to avoid stale state
             -- on a recycled button whose previous shape differed.
             pcall(ov.rim.SetMask, ov.rim, nil)
             if maskPath then
-                pcall(ov.rim.SetMask, ov.rim, maskPath)
+                maskOk = pcall(ov.rim.SetMask, ov.rim, maskPath)
             end
             ov.rim:SetVertexColor(r, g, b, visual.rimAlpha or 0.8)
             ov.rim:Show()
@@ -336,6 +565,49 @@ local function PaintStructural(ov, button, visual)
         end
     else
         ov.rim:Hide()
+    end
+
+    -- Rate-limited warnings. Visible failure: chat tells the user a node
+    -- couldn't be classified or an atlas was missing, so the absence of a rim
+    -- is intentional and traceable rather than a silent regression.
+    if not visualShape and nodeID and not OverlayManager._warnedShape[nodeID] then
+        OverlayManager._warnedShape[nodeID] = true
+        if TalentDiff.Print then
+            TalentDiff:Print(string.format(
+                "could not read visual shape from node %s regions — rim suppressed (gameplayShape=%s)",
+                tostring(nodeID), tostring(gameplayShape)))
+        end
+    end
+    if atlasName and atlasOk == false and nodeID then
+        local key = tostring(nodeID) .. "/" .. atlasName
+        if not OverlayManager._warnedAtlas[key] then
+            OverlayManager._warnedAtlas[key] = true
+            if TalentDiff.Print then
+                TalentDiff:Print(string.format("atlas '%s' not found for node %s — rim suppressed",
+                    atlasName, tostring(nodeID)))
+            end
+        end
+    end
+
+    -- One-shot diagnostic capture. Triggered by /td debug; each painted node
+    -- pushes a header line + an indented region dump into the buffer, which
+    -- RefreshAll flushes into the copyable debug window once the pass
+    -- completes. The region dump is what tells us which atlas/texture names
+    -- Blizzard hangs on each button — that's how we extend the visual
+    -- classifier when new shape variants appear.
+    if OverlayManager.diagnoseOnce and OverlayManager._diagnoseBuffer then
+        local infoType = info and info.type
+        local buf = OverlayManager._diagnoseBuffer
+        -- visualShape is what we render against; gameplayShape is the
+        -- info.type-derived bucket, kept here for cross-check only.
+        buf[#buf + 1] = string.format(
+            "node=%s info.type=%s visualShape=%s (%s='%s') gameplayShape=%s visualAtlas=%s setAtlas-found=%s mask=%s setMask-ok=%s",
+            tostring(nodeID), tostring(infoType),
+            tostring(visualShape), tostring(visualSrcKey), tostring(visualSrcVal),
+            tostring(gameplayShape),
+            tostring(atlasName), tostring(atlasOk),
+            tostring(maskPath), tostring(maskOk))
+        buf[#buf + 1] = "  regions: " .. DumpButtonRegions(button)
     end
 
     ApplyIconDesaturate(ov, button, visual.desaturate == true)
@@ -367,6 +639,18 @@ function OverlayManager:Apply(button, nodeDiff)
     -- still wanted. Plain table value on the active set; the button itself is
     -- the key so iteration order doesn't matter.
     self.activeButtons[button] = self.generation
+end
+
+-- Flips the diagnostic flag for the next paint pass. /td debug calls this
+-- followed by TalentDiff:RefreshOverlays(); each painted node pushes one
+-- line into the buffer, and RefreshAll flushes the buffer into the copyable
+-- debug window once the pass completes.
+function OverlayManager:Diagnose()
+    self.diagnoseOnce = true
+    self._diagnoseBuffer = {}
+    if TalentDiff.Print then
+        TalentDiff:Print("debug: next overlay paint will open a copyable diagnostics window")
+    end
 end
 
 function OverlayManager:Release(button)
@@ -434,6 +718,23 @@ function OverlayManager:RefreshAll(diff, iterButtons, getNodeID)
                 ov:Hide()
             end
             self.activeButtons[button] = nil
+        end
+    end
+
+    -- One-shot diagnostic: flush the buffer into the copyable debug window
+    -- and clear the flag so subsequent event-driven refreshes are quiet.
+    if self.diagnoseOnce then
+        self.diagnoseOnce = false
+        local buf = self._diagnoseBuffer
+        self._diagnoseBuffer = nil
+        if buf and TalentDiff.ShowDebugLog then
+            local body
+            if #buf == 0 then
+                body = "(no nodes were painted in this pass — open the talent UI and set a Compare-To target before running /td debug)"
+            else
+                body = table.concat(buf, "\n")
+            end
+            TalentDiff:ShowDebugLog("TalentDiff /td debug — overlay binding dump", body)
         end
     end
 end

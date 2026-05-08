@@ -124,5 +124,17 @@ SlashCmdList["TALENTDIFF"] = function(msg)
         TalentDiff:Print("Comparison cleared.")
         return
     end
-    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td clear to disable.")
+    if msg == "debug" then
+        -- Arms a one-shot diagnostic in OverlayManager: the next paint pass
+        -- prints per-node classification + atlas/mask binding, then auto-
+        -- clears so subsequent event-driven refreshes stay quiet.
+        if TalentDiff.OverlayManager and TalentDiff.OverlayManager.Diagnose then
+            TalentDiff.OverlayManager:Diagnose()
+            if TalentDiff.RefreshOverlays then TalentDiff:RefreshOverlays() end
+        else
+            TalentDiff:Print("OverlayManager not loaded.")
+        end
+        return
+    end
+    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td clear to disable. /td debug for one-shot diagnostics.")
 end

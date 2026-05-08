@@ -69,6 +69,91 @@ end
 -- enumerate buttons and resolve nodeIDs; the manager handles pool lifecycle,
 -- semantic state application, and stale-overlay reaping.
 
+-- ---------- Copyable debug log window --------------------------------------
+--
+-- Used by `/td debug` to surface per-node classification + atlas/mask binding
+-- in a window the user can select / copy from. WoW's chat frame doesn't allow
+-- copy/paste, so dumping multi-line diagnostics there is useless. A multiline
+-- EditBox inside a ScrollFrame is the standard WoW-native pattern for this
+-- (Blizzard's own /macro and /script error windows use the same approach).
+
+local debugLogPanel  -- created lazily on first ShowDebugLog call
+
+local DEBUG_PANEL_BACKDROP = {
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+}
+
+local function EnsureDebugLogPanel()
+    if debugLogPanel then return debugLogPanel end
+
+    local panel = CreateFrame("Frame", "TalentDiffDebugPanel", UIParent, "BackdropTemplate")
+    panel:SetSize(640, 420)
+    panel:SetFrameStrata("DIALOG")
+    panel:SetBackdrop(DEBUG_PANEL_BACKDROP)
+    panel:SetBackdropColor(0, 0, 0, 0.92)
+    panel:SetClampedToScreen(true)
+    panel:SetMovable(true)
+    panel:EnableMouse(true)
+    panel:RegisterForDrag("LeftButton")
+    panel:SetScript("OnDragStart", panel.StartMoving)
+    panel:SetScript("OnDragStop", panel.StopMovingOrSizing)
+    panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    panel:Hide()
+
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", panel, "TOP", 0, -10)
+    panel.title = title
+
+    local hint = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    hint:SetPoint("TOP", title, "BOTTOM", 0, -2)
+    hint:SetText("Click in the box, Ctrl+A to select all, Ctrl+C to copy.")
+    panel.hint = hint
+
+    local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", 2, 2)
+    close:SetScript("OnClick", function() panel:Hide() end)
+
+    -- ScrollFrame wraps a multiline EditBox. The EditBox auto-sizes its height
+    -- to its content via SetScript("OnTextChanged") + SetHeight; the scroll
+    -- frame handles the viewport. Standard WoW copy-paste pattern.
+    local scroll = CreateFrame("ScrollFrame", "$parentScroll", panel, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT",     panel, "TOPLEFT",      12, -50)
+    scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -32,  12)
+
+    local edit = CreateFrame("EditBox", nil, scroll)
+    edit:SetMultiLine(true)
+    edit:SetAutoFocus(false)
+    edit:SetFontObject("GameFontHighlightSmall")
+    edit:SetWidth(scroll:GetWidth())
+    edit:SetScript("OnEscapePressed", edit.ClearFocus)
+    -- Auto-grow height to content so ScrollFrame's vertical scrolling has the
+    -- right child extent. GetStringHeight is the standard WoW idiom for this.
+    edit:SetScript("OnTextChanged", function(self)
+        self:SetHeight(math.max(scroll:GetHeight(), self:GetStringHeight() + 8))
+    end)
+    scroll:SetScrollChild(edit)
+    panel.edit = edit
+    panel.scroll = scroll
+
+    debugLogPanel = panel
+    return panel
+end
+
+function TalentDiff:ShowDebugLog(title, text)
+    local panel = EnsureDebugLogPanel()
+    panel.title:SetText(title or "TalentDiff Debug")
+    panel.edit:SetText(text or "")
+    -- Park scroll at top + clear any focus from a prior session so the new
+    -- dump is immediately visible without the user having to scroll.
+    panel.scroll:SetVerticalScroll(0)
+    panel.edit:ClearFocus()
+    panel:Show()
+    panel:Raise()
+end
+
 function TalentDiff:RefreshOverlays()
     local talentFrame = GetTalentFrame()
     if not talentFrame then
