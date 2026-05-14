@@ -19,6 +19,7 @@ end
 local compareDropdown          -- the "Compare To" dropdown frame
 local swapButton                -- the "Swap To" button next to the dropdown
 local diffListToggle            -- "Show Diff" button next to swap
+local optionsCogButton          -- small cog icon to the right of Show Diff; toggles options frame
 local diffListPanel             -- floating panel showing per-row diff list
 local AppendTooltipForNode      -- forward declaration; defined in the tooltip-hook section
 local swapInProgress = false    -- true between LoadInProgress and TRAIT_CONFIG_UPDATED/CONFIG_COMMIT_FAILED
@@ -493,6 +494,37 @@ local function EnsureCompareDropdown(talentFrame)
     diffListToggle:SetScript("OnLeave", function() GameTooltip:Hide() end)
     diffListToggle:Hide()
 
+    -- Cog/settings icon button immediately right of Show Diff. Toggles the
+    -- TalentDiff options frame. Sized 22x22 to feel proportionate against the
+    -- 22px-tall UIPanelButtons. Texture: Interface\Buttons\UI-OptionsButton —
+    -- a Blizzard-shipped gear icon that's been stable across patches.
+    optionsCogButton = CreateFrame("Button", "TalentDiffOptionsCog", talentFrame)
+    optionsCogButton:SetSize(22, 22)
+    optionsCogButton:SetPoint("LEFT", diffListToggle, "RIGHT", 4, 0)
+
+    local cogTex = optionsCogButton:CreateTexture(nil, "ARTWORK")
+    cogTex:SetAllPoints(optionsCogButton)
+    cogTex:SetTexture("Interface\\Buttons\\UI-OptionsButton")
+    optionsCogButton.tex = cogTex
+
+    -- Highlight texture: standard Blizzard button glow on hover.
+    local cogHi = optionsCogButton:CreateTexture(nil, "HIGHLIGHT")
+    cogHi:SetAllPoints(optionsCogButton)
+    cogHi:SetTexture("Interface\\Buttons\\ButtonHilight-Square")
+    cogHi:SetBlendMode("ADD")
+
+    optionsCogButton:SetScript("OnClick", function()
+        if TalentDiff.ToggleOptions then TalentDiff:ToggleOptions() end
+    end)
+    optionsCogButton:SetScript("OnEnter", function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("TalentDiff Options", 1, 1, 1)
+        GameTooltip:AddLine("Tune overlay color, thickness, alpha, and the breathing animation.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    optionsCogButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
     return compareDropdown
 end
 
@@ -923,6 +955,10 @@ local function HookTalentFrame()
         -- of truth; we don't need to re-iterate buttons here.
         OverlayManager:ClearAll()
         if diffListPanel then diffListPanel:Hide() end
+        -- Options frame piggy-backs on the talent frame's lifecycle: closing
+        -- the talent UI auto-dismisses the (otherwise floating) options window
+        -- so no orphaned panel lingers on screen.
+        if TalentDiff._optionsFrame then TalentDiff._optionsFrame:Hide() end
     end)
 
     -- Hook updates that re-layout buttons (rank changes, refunds, switches).

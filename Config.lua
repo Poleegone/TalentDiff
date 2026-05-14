@@ -17,10 +17,13 @@ TD.Config = TD.Config or {}
 local Config = TD.Config
 
 local DEFAULTS = {
-    overlayIntensity = 1.0,  -- 0.2 .. 2.0  — multiplies STATUS_VISUAL.color RGB
-    overlayScale     = 1.0,  -- 0.8 .. 1.5  — multiplies rimPad (apparent ring outset)
-    rimThickness     = 1.0,  -- 0.0 .. 3.0  — second multiplier on rimPad (thicker band)
-    overlayAlpha     = 1.0,  -- 0.1 .. 1.0  — multiplies STATUS_VISUAL.rimAlpha
+    overlayIntensity  = 1.0,  -- 0.2 .. 2.0  — multiplies STATUS_VISUAL.color RGB
+    overlayScale      = 1.0,  -- 0.8 .. 1.5  — multiplies rimPad (apparent ring outset)
+    rimThickness      = 1.0,  -- 0.0 .. 3.0  — second multiplier on rimPad (thicker band)
+    overlayAlpha      = 1.0,  -- 0.1 .. 1.0  — multiplies STATUS_VISUAL.rimAlpha
+    enableAnimations  = true, -- master on/off for the gentle alpha pulse
+    animationStrength = 1.0,  -- 0.2 .. 2.0  — scales the alpha dip depth
+    animationSpeed    = 1.0,  -- 0.5 .. 1.8  — scales pulse rate (>1 = faster)
 }
 
 -- Read-only view of defaults; callers must not mutate.
@@ -47,21 +50,25 @@ function Config.Get(key)
     return v
 end
 
--- Set + restyle. Single entry point so the slash-command path, the slider
+-- Set + refresh. Single entry point so the slash-command path, the slider
 -- callbacks, and any future preset system all funnel through one helper.
+-- We always call OverlayManager:RefreshVisualSettings — it does both a
+-- RestyleAll (style/color/anchor refresh) and an UpdateAnimationsAll (anim
+-- state re-evaluation). Routing different key types to different subset
+-- helpers was a source of bugs (overlayAlpha changes ceiling AND animation
+-- floor; enableAnimations changes anim AND should redraw stopped rims at
+-- their resting alpha). One unified path is correct and cheap.
 function Config.Set(key, value)
     if TalentDiffDB == nil then TalentDiffDB = {} end
     if DEFAULTS[key] == nil then return end  -- guard typos
     TalentDiffDB[key] = value
-    if TD.OverlayManager and TD.OverlayManager.RestyleAll then
-        TD.OverlayManager:RestyleAll()
-    end
+    local OM = TD.OverlayManager
+    if OM and OM.RefreshVisualSettings then OM:RefreshVisualSettings() end
 end
 
 function Config.Reset()
     if TalentDiffDB == nil then TalentDiffDB = {} end
     for k, v in pairs(DEFAULTS) do TalentDiffDB[k] = v end
-    if TD.OverlayManager and TD.OverlayManager.RestyleAll then
-        TD.OverlayManager:RestyleAll()
-    end
+    local OM = TD.OverlayManager
+    if OM and OM.RefreshVisualSettings then OM:RefreshVisualSettings() end
 end

@@ -92,6 +92,54 @@ OverlayManager.pool = setmetatable({}, { __mode = "k" })
 OverlayManager.activeButtons = {}
 OverlayManager.generation = 0
 
+-- Animation profile + global synchronized clock.
+--
+-- ARCHITECTURE: ONE shared OnUpdate-driven phase counter for the entire addon,
+-- not one AnimationGroup per overlay. Every animated overlay reads from the
+-- same `AnimState.phase` each frame, so 30 painted nodes pulse in perfect
+-- lockstep with no possibility of drift, no per-overlay restart on refresh,
+-- and no asynchronous flashing when overlays are recreated mid-pulse.
+--
+-- The per-overlay AnimationGroup approach (now removed) caused visible desync
+-- because each group started its clock at the timestamp it was first Played,
+-- and any RefreshAll / Apply that recreated overlays restarted phase 0 for
+-- those specific nodes. The global clock survives any refresh — its phase
+-- only ever advances; new overlays just join the wave wherever it is now.
+--
+-- Alpha-only by design (still). Mask alignment is inviolable; SetScale on
+-- textures would drift the rim off the Blizzard mask silhouette.
+--
+--   alphaDip       : depth of the dip relative to resting alpha at strength=1.
+--                    0.15 → trough sits at restingAlpha * 0.85. Strength slider
+--                    multiplies this.
+--   basePeriod     : seconds for one full breathe at speed=1.0. ~2.0s is the
+--                    "premium UI breathe" zone. Speed slider divides this.
+--   minPeriod      : floor so the speed slider can't produce a flicker.
+--   statusEnabled  : per-status opt-in. ADDED + REMOVED only.
+local STATUS_ADDED   = (TalentDiff.STATUS and TalentDiff.STATUS.ADDED)   or 1
+local STATUS_REMOVED = (TalentDiff.STATUS and TalentDiff.STATUS.REMOVED) or 2
+
+local ANIMATION_PROFILE = {
+    alphaDip   = 0.55,
+    basePeriod = 2.0,
+    minPeriod  = 0.9,
+    statusEnabled = {
+        [STATUS_ADDED]   = true,
+        [STATUS_REMOVED] = true,
+    },
+}
+
+-- Global animation clock. Phase advances monotonically while the driver runs;
+-- it is never reset, so overlay churn (refresh / spec change / loadout swap)
+-- cannot restart the wave. The driver lazy-stops itself when the active set
+-- is empty so we don't burn frames painting nothing.
+local AnimState = {
+    phase = 0,
+    enabled = true,
+}
+
+OverlayManager._animState = AnimState  -- expose for /td animdebug
+
 -- One-shot diagnostic. /td debug flips this true; the next paint pass
 -- collects per-button classification + atlas/mask binding into the buffer,
 -- and RefreshAll's tail flushes the buffer into TalentDiff:ShowDebugLog (a
@@ -435,6 +483,11 @@ local function GetOrCreate(self, button)
 
     ov.edges = { top = top, bottom = bottom, left = left, right = right }
 
+    -- Animation: NO per-overlay clock. The global driver (OverlayManager._animDriver)
+    -- writes this overlay's rim alpha each frame when ov._animated is true.
+    -- New overlays inherit the current phase automatically — no Play, no
+    -- restart, no per-node desync.
+
     -- Numeric rank-delta label. Try a punchier outlined template first; CreateFontString
     -- errors on unknown names, so wrap in pcall and fall back to a guaranteed template.
     local ok, delta = pcall(ov.CreateFontString, ov, nil, "OVERLAY", "NumberFontNormalLargeRightOutline")
@@ -667,6 +720,134 @@ local function PaintStructural(ov, button, visual)
     ov.delta:Hide()
 end
 
+-- ---------- animation lifecycle (global synchronized clock) ---------------
+--
+-- ARCHITECTURE: ONE OnUpdate-driven phase counter. Every animated overlay
+-- reads `AnimState.phase` each frame and computes its own alpha as
+-- `restingAlpha * factor`, where factor is a shared sine-derived value in
+-- [1 - dip, 1]. Resting alpha is per-overlay (status × overlayAlpha config);
+-- the *phase* is global. So all overlays breathe in perfect sync but each
+-- respects its own intensity ceiling.
+--
+-- Lifecycle:
+--   ApplyOverlayAnimation(ov, status)  — flag this overlay to follow the wave
+--   StopOverlayAnimation(ov)           — clear flag, restore resting alpha
+--   UpdateOverlayAnimation(ov)         — re-evaluate the flag from config
+--   UpdateAnimationsAll()              — sweep the active set
+--
+-- All four are O(1) flag flips plus an alpha restore. The global driver is
+-- the only place per-frame work happens; it auto-stops when no overlay is
+-- animated, so a tree with no diff costs zero per-frame CPU.
+
+-- Driver frame. Created once. Walks activeButtons each frame, computing one
+-- shared sine factor and writing per-overlay alpha. No table allocation, no
+-- closures, no per-frame overlay rebuilds.
+local animDriver = CreateFrame("Frame")
+animDriver:Hide()
+OverlayManager._animDriver = animDriver
+
+animDriver:SetScript("OnUpdate", function(_, elapsed)
+    local speed = GetCfg("animationSpeed") or 1.0
+    AnimState.phase = AnimState.phase + elapsed * speed
+    if not GetCfg("enableAnimations") then return end
+
+    local strength = GetCfg("animationStrength") or 1.0
+    local dip = ANIMATION_PROFILE.alphaDip * strength
+    -- Period scaling: speed is folded into phase advance; the sine just needs
+    -- the base angular frequency. minPeriod is the floor for sane UX.
+    local period = math.max(ANIMATION_PROFILE.minPeriod, ANIMATION_PROFILE.basePeriod)
+    local omega = (2 * math.pi) / period
+    -- Sine in [-1, 1] → [0, 1], then dip-scaled and inverted so the multiplier
+    -- sits in [1 - dip, 1]: peak at sine crest, gentle trough below.
+    local s = (math.sin(AnimState.phase * omega) + 1) * 0.5
+    local factor = 1 - dip * (1 - s)
+
+    local pool = OverlayManager.pool
+    for button in pairs(OverlayManager.activeButtons) do
+        local ov = pool[button]
+        if ov and ov._animated and ov.rim then
+            local resting = ov._restingAlpha or 1
+            local r, g, b = ov.rim:GetVertexColor()
+            ov.rim:SetVertexColor(r or 1, g or 1, b or 1, resting * factor)
+        end
+    end
+end)
+
+local function startDriverIfNeeded()
+    if not animDriver:IsShown() and (OverlayManager._animatedCount or 0) > 0 then
+        animDriver:Show()
+    end
+end
+local function stopDriverIfIdle()
+    if animDriver:IsShown() and (OverlayManager._animatedCount or 0) <= 0 then
+        animDriver:Hide()
+    end
+end
+
+OverlayManager._animatedCount = 0  -- diagnostics; mirrors animated overlays
+
+-- Compute resting alpha deterministically from STATUS_VISUAL + config. This
+-- MUST NOT read the rim's current vertex alpha — the global animation driver
+-- continuously rewrites that to `restingAlpha * factor`, so reading it back
+-- captures a mid-pulse value and compounds toward zero on every slider tick.
+-- That was the "overlays disappear when sliders move" bug.
+local function ComputeRestingAlpha(status)
+    local visual = STATUS_VISUAL[status]
+    if not visual then return 1 end
+    return (visual.rimAlpha or 0) * (GetCfg("overlayAlpha") or 1)
+end
+
+function OverlayManager:ApplyOverlayAnimation(ov, status)
+    if not ov or not ov.rim then return end
+    local enabled = GetCfg("enableAnimations") and ANIMATION_PROFILE.statusEnabled[status]
+    if not enabled or not ov.rim:IsShown() then
+        self:StopOverlayAnimation(ov)
+        return
+    end
+
+    -- Resting alpha is the configured ceiling, NOT a vertex-color read-back.
+    -- See ComputeRestingAlpha comment for why.
+    ov._restingAlpha = ComputeRestingAlpha(status)
+
+    if not ov._animated then
+        ov._animated = true
+        self._animatedCount = (self._animatedCount or 0) + 1
+        startDriverIfNeeded()
+    end
+end
+
+function OverlayManager:StopOverlayAnimation(ov)
+    if not ov then return end
+    if ov._animated then
+        ov._animated = false
+        self._animatedCount = math.max(0, (self._animatedCount or 0) - 1)
+        stopDriverIfIdle()
+    end
+    -- Restore resting alpha so a stopped overlay sits at its full configured
+    -- ceiling, not wherever the driver last left it mid-cycle.
+    if ov.rim and ov._restingAlpha then
+        local r, g, b = ov.rim:GetVertexColor()
+        ov.rim:SetVertexColor(r or 1, g or 1, b or 1, ov._restingAlpha)
+    end
+end
+
+function OverlayManager:UpdateOverlayAnimation(ov)
+    if not ov then return end
+    self:ApplyOverlayAnimation(ov, ov._status)
+end
+
+-- Sweep the active set. Called from Config.Set when an animation key (or
+-- overlayAlpha — which moves each overlay's resting ceiling) changes. Cheap:
+-- per-overlay work is a flag check + a vertex-color read for the new resting
+-- alpha. The driver itself doesn't need waking; it's already running iff any
+-- overlay is animated.
+function OverlayManager:UpdateAnimationsAll()
+    for button, _ in pairs(self.activeButtons) do
+        local ov = self.pool[button]
+        if ov then self:UpdateOverlayAnimation(ov) end
+    end
+end
+
 -- ---------- public API -----------------------------------------------------
 
 function OverlayManager:Apply(button, nodeDiff)
@@ -691,6 +872,7 @@ function OverlayManager:Apply(button, nodeDiff)
         PaintStructural(ov, button, visual)
     end
     ov:Show()
+    self:ApplyOverlayAnimation(ov, nodeDiff.status)
 
     -- Stamp the generation so RefreshAll's reaper pass knows this overlay is
     -- still wanted. Plain table value on the active set; the button itself is
@@ -724,6 +906,10 @@ function OverlayManager:Restyle(button, ov)
         ov.rim:SetPoint("BOTTOMRIGHT", anchorTo, "BOTTOMRIGHT",  pad, -pad)
         ov.rim:SetVertexColor(r, g, b, alpha)
     end
+    -- Always re-evaluate the animation state — even when the rim is hidden,
+    -- ApplyOverlayAnimation correctly Stops the pulse and clears _animated, so
+    -- a previously-animated overlay that lost its rim doesn't keep ticking.
+    self:ApplyOverlayAnimation(ov, status)
 end
 
 -- Walk the active set and Restyle each overlay. Called from Config.Set so
@@ -735,6 +921,16 @@ function OverlayManager:RestyleAll()
         local ov = self.pool[button]
         if ov then self:Restyle(button, ov) end
     end
+end
+
+-- Single public entry point that does the right thing for ANY config change:
+-- re-tints + re-anchors every active overlay, then re-evaluates animation
+-- state. Cheap (no atlas / mask / shape work, no pool churn, no overlay
+-- rebuild). Suitable to call from any slider / checkbox callback without
+-- worrying about which kind of setting changed.
+function OverlayManager:RefreshVisualSettings()
+    self:RestyleAll()
+    self:UpdateAnimationsAll()
 end
 
 -- Flips the diagnostic flag for the next paint pass. /td debug calls this
@@ -753,6 +949,7 @@ function OverlayManager:Release(button)
     if not button then return end
     local ov = self.pool[button]
     if ov then
+        self:StopOverlayAnimation(ov)
         ApplyIconDesaturate(ov, button, false)
         ov:Hide()
     end
@@ -763,6 +960,7 @@ function OverlayManager:ClearAll()
     for button in pairs(self.activeButtons) do
         local ov = self.pool[button]
         if ov then
+            self:StopOverlayAnimation(ov)
             ApplyIconDesaturate(ov, button, false)
             ov:Hide()
         end
@@ -810,6 +1008,7 @@ function OverlayManager:RefreshAll(diff, iterButtons, getNodeID)
         if stamp ~= gen then
             local ov = self.pool[button]
             if ov then
+                self:StopOverlayAnimation(ov)
                 ApplyIconDesaturate(ov, button, false)
                 ov:Hide()
             end
@@ -829,9 +1028,13 @@ function OverlayManager:RefreshAll(diff, iterButtons, getNodeID)
             -- Helpful when triaging "looks wrong" reports — the slider state
             -- is the first thing to rule out.
             local header = string.format(
-                "config: overlayIntensity=%.2f overlayScale=%.2f rimThickness=%.2f overlayAlpha=%.2f",
+                "config: overlayIntensity=%.2f overlayScale=%.2f rimThickness=%.2f overlayAlpha=%.2f\n"
+             .. "anim:   enableAnimations=%s animationStrength=%.2f animationSpeed=%.2f animatedOverlays=%d",
                 GetCfg("overlayIntensity"), GetCfg("overlayScale"),
-                GetCfg("rimThickness"),     GetCfg("overlayAlpha"))
+                GetCfg("rimThickness"),     GetCfg("overlayAlpha"),
+                tostring(GetCfg("enableAnimations") and true or false),
+                GetCfg("animationStrength"), GetCfg("animationSpeed"),
+                self._animatedCount or 0)
             local body
             if #buf == 0 then
                 body = header .. "\n(no nodes were painted in this pass — open the talent UI and set a Compare-To target before running /td debug)"

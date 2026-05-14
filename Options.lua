@@ -11,12 +11,18 @@ local TD = TalentDiff
 -- OverlayManager:RestyleAll under the hood.
 -- ---------------------------------------------------------------------------
 
--- Slider rows. Each entry → one row in the window. Bounds match the spec.
+-- Row table. `kind="slider"` rows render as OptionsSliderTemplate; `kind="check"`
+-- rows render as a checkbox. Order is the visual top-to-bottom order in the
+-- window. Bounds match the spec; animation-strength / -speed slider ranges are
+-- intentionally narrow so the user cannot dial in flicker / arcade pulses.
 local ROWS = {
-    { key = "overlayIntensity", label = "Highlight Intensity", min = 0.20, max = 2.00, step = 0.05 },
-    { key = "overlayScale",     label = "Overlay Scale",       min = 0.80, max = 1.50, step = 0.05 },
-    { key = "rimThickness",     label = "Border Thickness",    min = 0.00, max = 3.00, step = 0.05 },
-    { key = "overlayAlpha",     label = "Overlay Alpha",       min = 0.10, max = 1.00, step = 0.05 },
+    { kind = "slider", key = "overlayIntensity",  label = "Highlight Intensity", min = 0.20, max = 2.00, step = 0.05 },
+    { kind = "slider", key = "overlayScale",      label = "Overlay Scale",       min = 0.80, max = 1.50, step = 0.05 },
+    { kind = "slider", key = "rimThickness",      label = "Border Thickness",    min = 0.00, max = 3.00, step = 0.05 },
+    { kind = "slider", key = "overlayAlpha",      label = "Overlay Alpha",       min = 0.10, max = 1.00, step = 0.05 },
+    { kind = "check",  key = "enableAnimations",  label = "Enable Animations" },
+    { kind = "slider", key = "animationStrength", label = "Animation Strength",  min = 0.20, max = 2.00, step = 0.05 },
+    { kind = "slider", key = "animationSpeed",    label = "Animation Speed",     min = 0.50, max = 1.80, step = 0.05 },
 }
 
 -- Build one slider row. Returns the slider; the value FontString is parented
@@ -59,9 +65,35 @@ local function MakeSliderRow(parent, row, yOffset)
     return slider
 end
 
+-- Checkbox row. Mirrors the slider row's contract: returns a widget with a
+-- `_refresh` closure so the BuildFrame loop can drive both uniformly.
+local function MakeCheckRow(parent, row, yOffset)
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetSize(26, 26)
+    cb:SetPoint("TOP", parent, "TOP", -110, yOffset)
+    if cb.Text then cb.Text:SetText(row.label) end
+
+    local syncing = false
+    cb:SetScript("OnClick", function(self)
+        if syncing then return end
+        if TD.Config and TD.Config.Set then
+            TD.Config.Set(row.key, self:GetChecked() and true or false)
+        end
+    end)
+
+    cb._refresh = function()
+        local v = TD.Config and TD.Config.Get and TD.Config.Get(row.key)
+        syncing = true
+        cb:SetChecked(v and true or false)
+        syncing = false
+    end
+
+    return cb
+end
+
 local function BuildFrame()
     local f = CreateFrame("Frame", "TalentDiffOptionsFrame", UIParent, "BackdropTemplate")
-    f:SetSize(320, 320)
+    f:SetSize(320, 480)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetToplevel(true)
@@ -93,8 +125,15 @@ local function BuildFrame()
     f._rows = {}
     local y = -50
     for _, row in ipairs(ROWS) do
-        f._rows[#f._rows + 1] = MakeSliderRow(f, row, y)
-        y = y - 50
+        local widget
+        if row.kind == "check" then
+            widget = MakeCheckRow(f, row, y)
+            y = y - 36
+        else
+            widget = MakeSliderRow(f, row, y)
+            y = y - 50
+        end
+        f._rows[#f._rows + 1] = widget
     end
 
     -- Reset-to-defaults button. Funnels through Config.Reset, then re-syncs

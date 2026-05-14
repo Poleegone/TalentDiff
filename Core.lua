@@ -157,5 +157,17 @@ SlashCmdList["TALENTDIFF"] = function(msg)
         end
         return
     end
-    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td options to tune overlays. /td clear to disable. /td reset for default visuals. /td debug for one-shot diagnostics.")
+    if msg == "animdebug" then
+        local OM = TalentDiff.OverlayManager
+        if OM and OM._animState then
+            local cfg = TalentDiff.Config and TalentDiff.Config.Get
+            local enabled = cfg and cfg("enableAnimations") or false
+            TalentDiff:Print(string.format("phase=%.2f overlays=%d enabled=%s",
+                OM._animState.phase or 0, OM._animatedCount or 0, tostring(enabled and true or false)))
+        else
+            TalentDiff:Print("OverlayManager not loaded.")
+        end
+        return
+    end
+    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td options to tune overlays. /td clear to disable. /td reset for default visuals. /td debug for one-shot diagnostics. /td animdebug for animation state.")
 end
