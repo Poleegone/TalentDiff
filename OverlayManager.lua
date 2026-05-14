@@ -28,11 +28,17 @@ local TalentDiff = TalentDiff
 --   glowAlpha  : LEGACY — alpha for the hollow-circle halo in fallback path
 --   glowPad    : LEGACY — outward pad for the halo in fallback path
 --   shadeAlpha : LEGACY — inward black shade in fallback path
+-- Geometry invariant: every structural status (ADDED / REMOVED / CHANGED)
+-- MUST use the same rimPad. Only color and alpha may legitimately differ
+-- between statuses; size/thickness must be identical so the overlay reads
+-- as the same kind of mark across the whole tree, just colored differently.
+-- RANK is a corner +N/-N text label — no rim painted, hence rimPad=0.
+local UNIFIED_RIM_PAD = 5
 local STATUS_VISUAL = {
-    [1] = { color = {0.10, 1.00, 0.25, 1.00}, rimAlpha = 0.85, rimPad = 5, desaturate = false, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED   (saturated green)
-    [2] = { color = {1.00, 0.08, 0.12, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = true,  glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.30 }, -- REMOVED (saturated red)
-    [3] = { color = {1.00, 0.78, 0.18, 1.00}, rimAlpha = 0.75, rimPad = 3, desaturate = false, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
-    [4] = { color = {0.50, 0.82, 1.00, 1.00}, rimAlpha = 0,    rimPad = 0, desaturate = false, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
+    [1] = { color = {0.10, 1.00, 0.25, 1.00}, rimAlpha = 0.85, rimPad = UNIFIED_RIM_PAD, desaturate = false, glowAlpha = 0.70, glowPad = 5, shadeAlpha = 0    }, -- ADDED   (saturated green)
+    [2] = { color = {1.00, 0.08, 0.12, 1.00}, rimAlpha = 0.75, rimPad = UNIFIED_RIM_PAD, desaturate = true,  glowAlpha = 0.45, glowPad = 3, shadeAlpha = 0.30 }, -- REMOVED (saturated red)
+    [3] = { color = {1.00, 0.78, 0.18, 1.00}, rimAlpha = 0.75, rimPad = UNIFIED_RIM_PAD, desaturate = false, glowAlpha = 0.55, glowPad = 3, shadeAlpha = 0    }, -- CHANGED
+    [4] = { color = {0.50, 0.82, 1.00, 1.00}, rimAlpha = 0,    rimPad = 0,               desaturate = false, glowAlpha = 0,    glowPad = 0, shadeAlpha = 0    }, -- RANK
 }
 
 -- Delta label colors mirror the rim hues so +N / -N stays visually coherent
