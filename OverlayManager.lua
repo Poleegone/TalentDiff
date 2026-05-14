@@ -57,6 +57,36 @@ local STATUS_RANK = (TalentDiff.STATUS and TalentDiff.STATUS.RANK) or 4
 local OverlayManager = {}
 TalentDiff.OverlayManager = OverlayManager
 
+-- Combine the per-status BASE styling (STATUS_VISUAL) with the user-facing
+-- multipliers in TalentDiff.Config. One choke point so both PaintStructural
+-- (initial paint) and Restyle (live slider re-tint) read the same numbers.
+--
+-- Returns (r, g, b, alpha, pad). The intensity multiplier is allowed to push
+-- channels past 1.0 — Texture:SetVertexColor saturates clamped to [0,1] in the
+-- shader pipeline, which is the visual we want (a brighter, more uniform tint
+-- on top of already-saturated base colors). pad multiplies BOTH overlayScale
+-- and rimThickness because the user-facing "size" and "thickness" sliders
+-- both ultimately move the same outset; keeping two knobs lets thickness
+-- dominate small adjustments while scale carries large ones.
+local function GetCfg(key)
+    local Config = TalentDiff and TalentDiff.Config
+    if Config and Config.Get then return Config.Get(key) end
+    return 1
+end
+
+function OverlayManager.ComputeEffective(visual)
+    local intensity = GetCfg("overlayIntensity")
+    local alpha     = GetCfg("overlayAlpha")
+    local scale     = GetCfg("overlayScale")
+    local thick     = GetCfg("rimThickness")
+    local r = (visual.color[1] or 0) * intensity
+    local g = (visual.color[2] or 0) * intensity
+    local b = (visual.color[3] or 0) * intensity
+    local a = (visual.rimAlpha or 0) * alpha
+    local pad = (visual.rimPad or 0) * scale * thick
+    return r, g, b, a, pad
+end
+
 -- Weak keys: a button frame dropped by Blizzard takes its overlay with it on GC.
 OverlayManager.pool = setmetatable({}, { __mode = "k" })
 OverlayManager.activeButtons = {}
@@ -479,8 +509,14 @@ local function PaintRank(ov, button, nodeDiff)
     local d = (nodeDiff.savedRank or 0) - (nodeDiff.currentRank or 0)
     local sign = d > 0 and "+" or ""
     ov.delta:SetText(sign .. tostring(d))
+    -- Stash for Restyle: the delta direction (sign of d) is the only thing
+    -- needed to re-tint without re-reading nodeDiff (which may not be in scope
+    -- when sliders fire after the diff has been freed).
+    ov._rankDelta = d
     local rgb = (d > 0) and DELTA_POS_RGB or DELTA_NEG_RGB
-    ov.delta:SetTextColor(rgb[1], rgb[2], rgb[3], 1)
+    local intensity = GetCfg("overlayIntensity")
+    local alpha     = GetCfg("overlayAlpha")
+    ov.delta:SetTextColor(rgb[1] * intensity, rgb[2] * intensity, rgb[3] * intensity, alpha)
     ov.delta:Show()
 end
 
@@ -509,7 +545,10 @@ end
 -- one-shot warning fires — never a circle fallback, never a rectangular
 -- fallback. Visible-broken beats silently-wrong.
 local function PaintStructural(ov, button, visual)
-    local r, g, b = visual.color[1], visual.color[2], visual.color[3]
+    -- Read effective (base * user-tunable multipliers) values via the single
+    -- combinator so live slider re-tints in Restyle stay in lock-step with
+    -- whatever PaintStructural would produce on a full Apply pass.
+    local r, g, b, alpha, pad = OverlayManager.ComputeEffective(visual)
 
     local visualShape, visualSrcKey, visualSrcVal = ResolveShapeFromAtlas(button)
     local gameplayShape, info = GetNodeShape(button)  -- diagnostics only
@@ -531,7 +570,6 @@ local function PaintStructural(ov, button, visual)
     -- "atlas was found" bool) — wrapping both in one pcall is the only way to
     -- distinguish "API errored" from "atlas missing".
     local atlasOk, maskOk
-    local pad = visual.rimPad or 0
     local anchorTo = button.StateBorder or button
 
     if atlasName then
@@ -549,7 +587,7 @@ local function PaintStructural(ov, button, visual)
             if maskPath then
                 maskOk = pcall(ov.rim.SetMask, ov.rim, maskPath)
             end
-            ov.rim:SetVertexColor(r, g, b, visual.rimAlpha or 0.8)
+            ov.rim:SetVertexColor(r, g, b, alpha)
             ov.rim:Show()
         else
             ov.rim:Hide()
@@ -643,6 +681,10 @@ function OverlayManager:Apply(button, nodeDiff)
     end
 
     local ov = GetOrCreate(self, button)
+    -- Stash status (and rank for RANK) on the overlay so Restyle can rebuild
+    -- the visual from config alone, without needing the source nodeDiff —
+    -- which won't be in scope when the slider callback fires later.
+    ov._status = nodeDiff.status
     if nodeDiff.status == STATUS_RANK then
         PaintRank(ov, button, nodeDiff)
     else
@@ -654,6 +696,45 @@ function OverlayManager:Apply(button, nodeDiff)
     -- still wanted. Plain table value on the active set; the button itself is
     -- the key so iteration order doesn't matter.
     self.activeButtons[button] = self.generation
+end
+
+-- Live re-tint of a single overlay using current config multipliers. Cheap
+-- path: only touches SetVertexColor and the rim anchor offsets — no atlas
+-- resolution, no SetMask, no shape re-classification, no texture allocation.
+-- Skips silently if the overlay was never given a status (defensive).
+function OverlayManager:Restyle(button, ov)
+    if not ov or not button then return end
+    local status = ov._status
+    if not status then return end
+    if status == STATUS_RANK then
+        local d = ov._rankDelta or 0
+        local rgb = (d > 0) and DELTA_POS_RGB or DELTA_NEG_RGB
+        local intensity = GetCfg("overlayIntensity")
+        local alpha     = GetCfg("overlayAlpha")
+        ov.delta:SetTextColor(rgb[1] * intensity, rgb[2] * intensity, rgb[3] * intensity, alpha)
+        return
+    end
+    local visual = STATUS_VISUAL[status]
+    if not visual then return end
+    local r, g, b, alpha, pad = OverlayManager.ComputeEffective(visual)
+    if ov.rim and ov.rim:IsShown() then
+        local anchorTo = button.StateBorder or button
+        ov.rim:ClearAllPoints()
+        ov.rim:SetPoint("TOPLEFT",     anchorTo, "TOPLEFT",     -pad,  pad)
+        ov.rim:SetPoint("BOTTOMRIGHT", anchorTo, "BOTTOMRIGHT",  pad, -pad)
+        ov.rim:SetVertexColor(r, g, b, alpha)
+    end
+end
+
+-- Walk the active set and Restyle each overlay. Called from Config.Set so
+-- every slider tick produces an immediate visible update. The active set is
+-- the only iteration domain — pool entries that aren't currently rendered
+-- (released or evicted) get the new style for free on their next Apply.
+function OverlayManager:RestyleAll()
+    for button, _ in pairs(self.activeButtons) do
+        local ov = self.pool[button]
+        if ov then self:Restyle(button, ov) end
+    end
 end
 
 -- Flips the diagnostic flag for the next paint pass. /td debug calls this
@@ -743,11 +824,19 @@ function OverlayManager:RefreshAll(diff, iterButtons, getNodeID)
         local buf = self._diagnoseBuffer
         self._diagnoseBuffer = nil
         if buf and TalentDiff.ShowDebugLog then
+            -- Prepend current user-tunable config so the dump captures both
+            -- the visual binding state AND the multipliers that produced it.
+            -- Helpful when triaging "looks wrong" reports — the slider state
+            -- is the first thing to rule out.
+            local header = string.format(
+                "config: overlayIntensity=%.2f overlayScale=%.2f rimThickness=%.2f overlayAlpha=%.2f",
+                GetCfg("overlayIntensity"), GetCfg("overlayScale"),
+                GetCfg("rimThickness"),     GetCfg("overlayAlpha"))
             local body
             if #buf == 0 then
-                body = "(no nodes were painted in this pass — open the talent UI and set a Compare-To target before running /td debug)"
+                body = header .. "\n(no nodes were painted in this pass — open the talent UI and set a Compare-To target before running /td debug)"
             else
-                body = table.concat(buf, "\n")
+                body = header .. "\n" .. table.concat(buf, "\n")
             end
             TalentDiff:ShowDebugLog("TalentDiff /td debug — overlay binding dump", body)
         end

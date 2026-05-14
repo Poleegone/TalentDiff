@@ -8,7 +8,9 @@
 ## SavedVariablesPerCharacter: TalentDiffDB
 
 Core.lua
+Config.lua
 Data.lua
 Compare.lua
 OverlayManager.lua
 UI.lua
+Options.lua

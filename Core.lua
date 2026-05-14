@@ -76,6 +76,12 @@ end
 
 local function OnEvent(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
+        -- SavedVariables (TalentDiffDB) are populated by WoW before
+        -- ADDON_LOADED fires for our addon, so this is the safe hook for
+        -- back-filling any missing config keys against the defaults table.
+        if TalentDiff.Config and TalentDiff.Config.Init then
+            TalentDiff.Config.Init()
+        end
         if TalentDiff.OnInit then TalentDiff:OnInit() end
     elseif event == "PLAYER_ENTERING_WORLD" then
         TalentDiff:MarkDirty()
@@ -124,6 +130,21 @@ SlashCmdList["TALENTDIFF"] = function(msg)
         TalentDiff:Print("Comparison cleared.")
         return
     end
+    if msg == "options" or msg == "config" or msg == "opt" then
+        if TalentDiff.ToggleOptions then
+            TalentDiff:ToggleOptions()
+        else
+            TalentDiff:Print("Options module not loaded.")
+        end
+        return
+    end
+    if msg == "reset" then
+        if TalentDiff.Config and TalentDiff.Config.Reset then
+            TalentDiff.Config.Reset()
+            TalentDiff:Print("Overlay settings reset to defaults.")
+        end
+        return
+    end
     if msg == "debug" then
         -- Arms a one-shot diagnostic in OverlayManager: the next paint pass
         -- prints per-node classification + atlas/mask binding, then auto-
@@ -136,5 +157,5 @@ SlashCmdList["TALENTDIFF"] = function(msg)
         end
         return
     end
-    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td clear to disable. /td debug for one-shot diagnostics.")
+    TalentDiff:Print("Open the talent UI and use the 'Compare To' selector. /td options to tune overlays. /td clear to disable. /td reset for default visuals. /td debug for one-shot diagnostics.")
 end
